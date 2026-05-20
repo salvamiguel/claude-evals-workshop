@@ -130,7 +130,7 @@ Decisión: GO / NO-GO (si cualquier regla falla → NO-GO)
 **Reglas en `config/rules.yaml`:**
 ```yaml
 rules:
-  # Exact Match
+  # ── Exact Match ──────────────────────────────────────────────────────────────
   - id: use_internal_http
     type: exact_match
     description: "HTTP calls must use httpx_internal, not requests"
@@ -143,7 +143,19 @@ rules:
     pattern: "print("
     match_type: forbidden
 
-  # Rule-Based
+  - id: no_wildcard_imports
+    type: exact_match
+    description: "Wildcard imports pollute namespace and hide dependencies"
+    pattern: "import *"
+    match_type: forbidden
+
+  - id: no_dynamic_code_execution
+    type: exact_match
+    description: "Dynamic code execution is a security risk and injection vector"
+    pattern: "eval"
+    match_type: forbidden
+
+  # ── Rule-Based ───────────────────────────────────────────────────────────────
   - id: no_magic_numbers
     type: rule_based
     description: "No magic numbers (int/float literals outside assignments)"
@@ -155,27 +167,61 @@ rules:
     forbidden_imports: [psycopg2, pymysql, sqlite3]
     approved_import: internal_db_client
 
-  # LLM-as-Judge
-  - id: no_anti_patterns
-    type: llm_judge
-    description: "No anti-patterns: God class, hardcoded secrets, Singleton abuse"
-    criteria: |
-      Evaluate if the code contains any of these anti-patterns:
-      1. God Class: a single class doing too many things
-      2. Hardcoded secrets: API keys, passwords, tokens in code
-      3. Singleton abuse: using global state inappropriately
-      4. Magic strings: repeated string literals that should be constants
-    score_threshold: 7.0  # 0-10, debe estar >= threshold para pasar
+  - id: no_bare_except
+    type: rule_based
+    description: "Bare except clauses hide errors — always specify the exception type"
+    # Detected via AST: ExceptHandler node with no type specified
 
-  - id: cloud_native_patterns
+  - id: max_function_args
+    type: rule_based
+    description: "Functions must not have more than 5 parameters"
+    max_args: 5
+    # Detected via AST: FunctionDef with len(args.args) > 5
+
+  # ── LLM-as-Judge ─────────────────────────────────────────────────────────────
+  - id: no_hardcoded_secrets
     type: llm_judge
-    description: "Code follows cloud-native patterns (stateless, 12-factor)"
+    description: "No hardcoded API keys, passwords, or tokens in code"
     criteria: |
-      Evaluate adherence to cloud-native principles:
-      1. Stateless: no local state that cannot be recreated
-      2. Config from environment: no hardcoded config
-      3. Proper error handling with retries/timeouts
-      4. Structured logging (not print statements)
+      Check if the code contains hardcoded secrets: API keys, passwords,
+      tokens, connection strings, or any credential that should be stored
+      in environment variables or a secrets manager instead.
+    score_threshold: 8.0
+
+  - id: use_cloud_native_storage
+    type: llm_judge
+    description: "Persistent storage must use cloud provider services (S3/Blob/GCS), not local filesystem"
+    criteria: |
+      Check if the code writes files to the local filesystem (open(), os.path,
+      shutil) for persistent storage instead of using cloud storage services
+      such as boto3/S3, Azure Blob Storage, or Google Cloud Storage.
+    score_threshold: 7.0
+
+  - id: single_responsibility
+    type: llm_judge
+    description: "Each function/class should have one clear responsibility"
+    criteria: |
+      Evaluate if functions or classes are doing too many unrelated things.
+      A function mixing business logic with I/O with formatting, or exceeding
+      ~20 lines for a single concern, is a violation.
+    score_threshold: 6.0
+
+  - id: external_calls_have_timeout
+    type: llm_judge
+    description: "All external HTTP/API calls must configure a timeout"
+    criteria: |
+      Check if every HTTP request (requests, httpx, urllib) includes a
+      timeout parameter. Calls without timeout can hang indefinitely and
+      bring down the service.
+    score_threshold: 7.0
+
+  - id: meaningful_naming
+    type: llm_judge
+    description: "Variables and functions must have descriptive names"
+    criteria: |
+      Check for single-letter variable names outside of loop counters (i, j, k),
+      non-standard abbreviations (e.g., usr, tmp2, fn2), or function names
+      that do not describe their behaviour (e.g., process, handle, do_stuff).
     score_threshold: 6.0
 ```
 
