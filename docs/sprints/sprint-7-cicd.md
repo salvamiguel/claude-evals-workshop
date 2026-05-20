@@ -111,12 +111,65 @@ def make_result_path(lab_id: str, model_id: str, results_dir: str = "results") -
 
 ### 4.3 Schema del JSON de resultados
 
-Todos los scripts producen un JSON con la siguiente estructura mínima (compatible con el dashboard):
+El schema varía según el lab. El campo `lab` identifica el formato de cada JSON.
+
+**Lab 01** (`run_lab01.py`): el JSON contiene los resultados de **todos los test cases del golden dataset** para el `MODEL_ID` dado. El nombre del archivo sigue el patrón `results/YYYY-MM-DD_HH-MM_lab01_<model_id>.json` — un único archivo por ejecución, nunca uno por caso.
+
+`run_lab01.py` se invoca así desde el workflow:
+
+```
+python labs/01_sdlc_gatekeeper/01_sdlc_gatekeeper.py --model $MODEL_ID --output results/YYYY-MM-DD_HH-MM_lab01_<model_id>.json
+```
+
+```json
+{
+  "run_id": "2026-05-20T11:00:00Z",
+  "lab": "lab01",
+  "model": "claude-sonnet-4-6",
+  "test_cases": [
+    {
+      "case_id": "with_violations",
+      "agent_output": { "decision": "NO-GO", "violations": ["..."], "reasoning": "..." },
+      "quality": {
+        "decision_match": true,
+        "true_positives": 11,
+        "false_positives": 1,
+        "false_negatives": 2,
+        "precision": 0.917,
+        "recall": 0.846,
+        "f1": 0.880
+      },
+      "performance": {
+        "ttft_ms": 320,
+        "ttc_ms": 2100,
+        "otps": 48.5,
+        "input_tokens": 1512,
+        "output_tokens": 487,
+        "total_tokens": 1999,
+        "cost_usd": 0.012
+      },
+      "evaluators": []
+    }
+  ],
+  "aggregate": {
+    "overall_pass": true,
+    "avg_precision": 0.91,
+    "avg_recall": 0.92,
+    "avg_f1": 0.91,
+    "total_input_tokens": 3050,
+    "total_output_tokens": 720,
+    "total_cost_usd": 0.022,
+    "total_ttft_ms": 640
+  }
+}
+```
+
+**Labs 02, 03 y 04** siguen el schema genérico mínimo con `results[]` y `summary`:
 
 ```json
 {
   "run_id": "2026-05-20T11:00:00+00:00",
-  "lab": "lab01",
+  "lab": "lab02",
   "model": "claude-sonnet-4-6",
   "triggered_by": "github-actions",
   "results": [
@@ -144,7 +197,18 @@ Todos los scripts producen un JSON con la siguiente estructura mínima (compatib
 }
 ```
 
-### 4.4 `run_all.py` — Ejecución secuencial de todos los labs
+### 4.4 `run_lab01.py` — Comportamiento específico
+
+`run_lab01.py` invoca `labs/01_sdlc_gatekeeper/01_sdlc_gatekeeper.py` pasándole `--model $MODEL_ID` y `--output <ruta>`. El script ejecuta el agente SDLC gatekeeper sobre **todos los test cases del `golden_dataset.yaml`**, compara el output del agente con las violaciones esperadas del golden y calcula métricas de calidad (precision, recall, F1, decision_match) y de rendimiento (TTFT, TTC, OTPS, tokens, cost_usd) por test case. Produce **un único JSON** con todos los test cases y un bloque `aggregate`.
+
+```
+Un JSON por ejecución → results/YYYY-MM-DD_HH-MM_lab01_<model_id>.json
+Un array "test_cases" en ese JSON → N entradas (una por caso en golden_dataset.yaml)
+```
+
+No se genera un JSON separado por test case — esto simplifica la ingesta en el dashboard y en `plot_results.py`.
+
+### 4.5 `run_all.py` — Ejecución secuencial de todos los labs
 
 Cuando el usuario selecciona `lab_id = "all"` en el workflow, el script `run_all.py` importa y ejecuta los cuatro scripts en secuencia. Si uno falla, registra el error pero continúa con los siguientes (tolerancia a fallos parciales), y al final devuelve código `1` si al menos uno falló.
 
@@ -168,7 +232,7 @@ for script in LABS:
 sys.exit(1 if failures else 0)
 ```
 
-### 4.5 `requirements.txt` de `.github/scripts/`
+### 4.6 `requirements.txt` de `.github/scripts/`
 
 ```
 anthropic>=0.40.0
@@ -193,6 +257,8 @@ matplotlib>=3.7.0
 | `latency_ttft_ttc.png` | Grouped bar chart | TTFT medio vs TTC medio por modelo (labs que midan latencia) |
 | `otps_by_model.png` | Bar chart | Tokens por segundo (OTPS) medio por modelo |
 | `timeline.png` | Line chart | Evolución de pass_rate en el tiempo (eje X = run_id fecha) |
+| `lab01_quality_by_model.png` | Grouped bar chart | precision, recall y F1 medios de Lab 01 por modelo |
+| `lab01_cost_vs_f1.png` | Scatter plot | cost_usd total vs avg_f1 por modelo (tradeoff calidad/coste) |
 
 ### 5.2 Cómo lee los JSONs
 
@@ -289,6 +355,8 @@ Tras el primer despliegue exitoso, GitHub Pages puede tardar entre 1 y 3 minutos
 | 8 | El dashboard Vite+Vue3 queda desplegado en la URL de GitHub Pages y muestra las gráficas actualizadas | Abrir la URL pública |
 | 9 | `plot_results.py` ejecuta localmente con `python .github/scripts/plot_results.py` sin errores y genera los PNGs | Ejecución local |
 | 10 | `requirements.txt` instala sin errores con `pip install -r .github/scripts/requirements.txt` en Python 3.12 limpio | Verificación local o en CI |
+| 11 | El JSON de Lab 01 incluye métricas de rendimiento (`ttft_ms`, `ttc_ms`, `otps`, `input_tokens`, `output_tokens`, `total_tokens`, `cost_usd`) en cada `test_cases[].performance` | Validar campos en el JSON generado |
+| 12 | `plot_results.py` genera `lab01_quality_by_model.png` y `lab01_cost_vs_f1.png` cuando existen JSONs de Lab 01 en `results/` | Ejecución local con datos de prueba |
 
 ---
 
@@ -318,7 +386,7 @@ El workflow llama siempre al script correspondiente al `lab_id` elegido:
 - run: python .github/scripts/run_${{ inputs.lab_id }}.py
 ```
 
-Cuando `inputs.lab_id = "all"`, se ejecuta `run_all.py`. Este script invoca `run_lab01.py`, `run_lab02.py`, `run_lab03.py` y `run_lab04.py` como subprocesos separados (ver sección 4.4). Los cuatro scripts comparten las mismas variables de entorno del runner (`ANTHROPIC_API_KEY`, `MODEL_ID`).
+Cuando `inputs.lab_id = "all"`, se ejecuta `run_all.py`. Este script invoca `run_lab01.py`, `run_lab02.py`, `run_lab03.py` y `run_lab04.py` como subprocesos separados (ver sección 4.5). Los cuatro scripts comparten las mismas variables de entorno del runner (`ANTHROPIC_API_KEY`, `MODEL_ID`).
 
 ### 8.3 Seguridad — solo el dueño del repositorio puede ejecutar evals
 

@@ -55,15 +55,28 @@ Al terminar el sprint, cualquier persona con acceso a `https://<owner>.github.io
 ```js
 // metrics: array de objetos Lab03Result normalizados
 // metric: 'ttft_ms' | 'ttc_ms' | 'otps'  (cuál métrica mostrar)
+// Para el scatter de Lab 01: pasar mode='scatter_lab01' con lab01Runs[] en vez de metrics[]
 props: {
   metrics: {
     type: Array,      // [{ run_id, model, ttft_ms, ttc_ms, otps, cost_usd }]
-    required: true
+    default: () => []
   },
   metric: {
     type: String,
     default: 'ttft_ms',
     validator: (v) => ['ttft_ms', 'ttc_ms', 'otps'].includes(v)
+  },
+  // mode: 'bar' (Lab 03) | 'scatter_lab01' (tradeoff coste/calidad Lab 01)
+  mode: {
+    type: String,
+    default: 'bar',
+    validator: (v) => ['bar', 'scatter_lab01'].includes(v)
+  },
+  // lab01Runs: array de runs normalizadas de Lab 01 para el scatter
+  // Cada entrada: { model, metrics: { avgF1, totalCostUsd } }
+  lab01Runs: {
+    type: Array,
+    default: () => []
   }
 }
 ```
@@ -73,40 +86,51 @@ props: {
 ```vue
 <template>
   <div class="metrics-chart">
-    <div class="chart-controls">
-      <label>Métrica:</label>
-      <select v-model="selectedMetric">
-        <option value="ttft_ms">TTFT (ms)</option>
-        <option value="ttc_ms">TTC (ms)</option>
-        <option value="otps">Output tokens/s</option>
-      </select>
-    </div>
-    <Bar v-if="chartData" :data="chartData" :options="chartOptions" />
-    <p v-else class="empty-state">No hay datos de rendimiento disponibles.</p>
+    <!-- Modo bar: Lab 03 TTFT/TTC/OTPS -->
+    <template v-if="mode === 'bar'">
+      <div class="chart-controls">
+        <label>Métrica:</label>
+        <select v-model="selectedMetric">
+          <option value="ttft_ms">TTFT (ms)</option>
+          <option value="ttc_ms">TTC (ms)</option>
+          <option value="otps">Output tokens/s</option>
+        </select>
+      </div>
+      <Bar v-if="chartData" :data="chartData" :options="chartOptions" />
+      <p v-else class="empty-state">No hay datos de rendimiento disponibles.</p>
+    </template>
+
+    <!-- Modo scatter: Lab 01 cost_usd vs avg_f1 por modelo -->
+    <template v-else-if="mode === 'scatter_lab01'">
+      <h3 class="chart-title">Tradeoff calidad / coste — Lab 01</h3>
+      <Scatter v-if="scatterData" :data="scatterData" :options="scatterOptions" />
+      <p v-else class="empty-state">No hay datos de Lab 01 disponibles.</p>
+    </template>
   </div>
 </template>
 ```
+
+El scatter plot muestra un punto por modelo con `x = totalCostUsd` e `y = avgF1`, permitiendo comparar visualmente el tradeoff coste/calidad entre modelos.
 
 ---
 
 ### 4.2 `EvalResultsTable.vue`
 
-**Responsabilidad:** Mostrar una tabla de resultados de reglas para una run de Lab 01, agrupando por archivo evaluado. Cada fila indica regla, tipo, resultado (PASS/FAIL), puntuación y evidencia.
+**Responsabilidad:** Mostrar los resultados de evaluación de Lab 01, con una fila por test case del golden dataset. Cada fila muestra métricas de calidad y rendimiento del agente gatekeeper.
 
 **Props:**
 
 ```js
 props: {
-  results: {
-    type: Array,    // [{ rule_id, type, passed, evidence, score }]
+  // testCases: array normalizado de test case results de Lab 01
+  // Cada entrada: { caseId, decisionMatch, f1, ttftMs, costUsd }
+  testCases: {
+    type: Array,
     required: true
   },
-  file: {
-    type: String,   // ruta del archivo evaluado
-    required: true
-  },
-  decision: {
-    type: String,   // 'GO' | 'NO-GO'
+  // overallPass: decisión global de la run
+  overallPass: {
+    type: Boolean,
     required: true
   }
 }
@@ -117,25 +141,35 @@ props: {
 ```vue
 <template>
   <div class="eval-results-table">
-    <div class="file-header">
-      <code>{{ file }}</code>
-      <span :class="['badge', decision === 'GO' ? 'badge--go' : 'badge--nogo']">
-        {{ decision }}
+    <div class="run-header">
+      <span :class="['badge', overallPass ? 'badge--go' : 'badge--nogo']">
+        {{ overallPass ? 'OVERALL PASS' : 'OVERALL FAIL' }}
       </span>
+      <span class="case-count">{{ testCases.length }} test cases evaluados</span>
     </div>
+
     <table>
       <thead>
         <tr>
-          <th>Regla</th><th>Tipo</th><th>Resultado</th><th>Score</th><th>Evidencia</th>
+          <th>case_id</th>
+          <th>decision_match</th>
+          <th>precision</th>
+          <th>recall</th>
+          <th>f1</th>
+          <th>ttft_ms</th>
+          <th>cost_usd</th>
         </tr>
       </thead>
       <tbody>
-        <tr v-for="r in results" :key="r.rule_id" :class="r.passed ? 'row--pass' : 'row--fail'">
-          <td>{{ r.rule_id }}</td>
-          <td><span class="type-badge">{{ r.type }}</span></td>
-          <td>{{ r.passed ? '✓ PASS' : '✗ FAIL' }}</td>
-          <td>{{ r.score?.toFixed(1) ?? '—' }}</td>
-          <td class="evidence">{{ r.evidence }}</td>
+        <tr v-for="tc in testCases" :key="tc.caseId"
+            :class="tc.decisionMatch ? 'row--pass' : 'row--fail'">
+          <td><code>{{ tc.caseId }}</code></td>
+          <td>{{ tc.decisionMatch ? '✓' : '✗' }}</td>
+          <td>{{ tc.precision?.toFixed(3) ?? '—' }}</td>
+          <td>{{ tc.recall?.toFixed(3) ?? '—' }}</td>
+          <td>{{ tc.f1?.toFixed(3) ?? '—' }}</td>
+          <td>{{ tc.ttftMs ?? '—' }}</td>
+          <td>{{ tc.costUsd != null ? `$${tc.costUsd.toFixed(4)}` : '—' }}</td>
         </tr>
       </tbody>
     </table>
@@ -273,12 +307,11 @@ const filteredRuns = computed(() =>
     <h1>{{ run.lab }} — {{ run.model }}</h1>
     <p class="run-id">Run: {{ run.run_id }}</p>
 
-    <!-- Lab 01: tabla de reglas -->
+    <!-- Lab 01: tabla de test cases con métricas de calidad y rendimiento -->
     <EvalResultsTable
       v-if="run.lab === 'lab01'"
-      :results="run.results"
-      :file="run.file"
-      :decision="run.decision"
+      :test-cases="run.testCases"
+      :overall-pass="run.metrics?.overallPass ?? false"
     />
 
     <!-- Lab 02: métricas de calidad -->
@@ -312,6 +345,53 @@ const filteredRuns = computed(() =>
 ---
 
 ## 5. Carga de datos con `import.meta.glob`
+
+### 5.0 Schema de los JSONs de resultados — Lab 01
+
+El dashboard consume JSONs de Lab 01 con la siguiente estructura (un archivo por ejecución, todos los test cases incluidos):
+
+```json
+{
+  "run_id": "2026-05-20T11:00:00Z",
+  "lab": "lab01",
+  "model": "claude-sonnet-4-6",
+  "test_cases": [
+    {
+      "case_id": "with_violations",
+      "agent_output": { "decision": "NO-GO", "violations": ["..."], "reasoning": "..." },
+      "quality": {
+        "decision_match": true,
+        "true_positives": 11,
+        "false_positives": 1,
+        "false_negatives": 2,
+        "precision": 0.917,
+        "recall": 0.846,
+        "f1": 0.880
+      },
+      "performance": {
+        "ttft_ms": 320,
+        "ttc_ms": 2100,
+        "otps": 48.5,
+        "input_tokens": 1512,
+        "output_tokens": 487,
+        "total_tokens": 1999,
+        "cost_usd": 0.012
+      },
+      "evaluators": []
+    }
+  ],
+  "aggregate": {
+    "overall_pass": true,
+    "avg_precision": 0.91,
+    "avg_recall": 0.92,
+    "avg_f1": 0.91,
+    "total_input_tokens": 3050,
+    "total_output_tokens": 720,
+    "total_cost_usd": 0.022,
+    "total_ttft_ms": 640
+  }
+}
+```
 
 ### 5.1 Importación en el store de Pinia
 
@@ -368,14 +448,30 @@ function normalizeRun(raw) {
   }
 
   if (raw.lab === 'lab01') {
+    // Lab 01: agente SDLC gatekeeper evaluado contra golden_dataset
+    // raw.test_cases[] cada entrada: { case_id, agent_output, quality{}, performance{}, evaluators[] }
+    // raw.aggregate: { overall_pass, avg_precision, avg_recall, avg_f1, total_cost_usd, total_ttft_ms, ... }
     return {
       ...base,
-      file:            raw.file,
-      results:         raw.results ?? [],
-      decision:        raw.decision,
-      passed_rules:    raw.passed_rules,
-      failed_rules:    raw.failed_rules,
-      aggregate_score: raw.aggregate_score,
+      metrics: {
+        avgPrecision: raw.aggregate?.avg_precision ?? null,
+        avgRecall:    raw.aggregate?.avg_recall ?? null,
+        avgF1:        raw.aggregate?.avg_f1 ?? null,
+        totalCostUsd: raw.aggregate?.total_cost_usd ?? null,
+        totalTtftMs:  raw.aggregate?.total_ttft_ms ?? null,
+        overallPass:  raw.aggregate?.overall_pass ?? null,
+      },
+      testCases: (raw.test_cases ?? []).map(tc => ({
+        caseId:        tc.case_id,
+        decisionMatch: tc.quality?.decision_match,
+        f1:            tc.quality?.f1,
+        ttftMs:        tc.performance?.ttft_ms,
+        costUsd:       tc.performance?.cost_usd,
+      })),
+      // Campos de compatibilidad para Overview
+      decision:        raw.aggregate?.overall_pass ? 'GO' : 'NO-GO',
+      aggregate_score: raw.aggregate?.avg_f1 ?? null,
+      cost_usd:        raw.aggregate?.total_cost_usd ?? null,
     }
   }
 

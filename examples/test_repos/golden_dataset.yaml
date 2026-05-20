@@ -1,0 +1,23 @@
+test_cases:
+  - case_id: with_violations
+    repo_path: examples/test_repos/with_violations
+    expected_decision: NO-GO
+    expected_violations:
+      - { rule_id: use_internal_http,           file: api_client.py }
+      - { rule_id: no_print_statements,         file: api_client.py }
+      - { rule_id: external_calls_have_timeout, file: api_client.py }
+      - { rule_id: meaningful_naming,           file: api_client.py }
+      - { rule_id: no_wildcard_imports,         file: data_processor.py }
+      - { rule_id: use_internal_db,             file: data_processor.py }
+      - { rule_id: no_magic_numbers,            file: data_processor.py }
+      - { rule_id: no_bare_except,              file: data_processor.py }
+      - { rule_id: no_hardcoded_secrets,        file: service.py }
+      - { rule_id: use_cloud_native_storage,    file: service.py }
+      - { rule_id: no_dynamic_code_execution,   file: service.py }
+      - { rule_id: single_responsibility,       file: service.py }
+      - { rule_id: use_internal_http,           file: service.py }
+
+  - case_id: clean
+    repo_path: examples/test_repos/clean
+    expected_decision: GO
+    expected_violations: []
