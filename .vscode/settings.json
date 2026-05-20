@@ -1,5 +1,4 @@
 {
-  "python.defaultInterpreterPath": "/usr/local/bin/python",
   "jupyter.notebookFileRoot": "${workspaceFolder}",
   "files.associations": { "*.ipynb": "jupyter-notebook" },
   "editor.formatOnSave": true,
