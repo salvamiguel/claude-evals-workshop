@@ -1,7 +1,7 @@
 # Claude Evals Workshop — Spec de Diseño
 
 **Fecha:** 2026-05-20
-**Audiencia:** Arquitectos y desarrolladores del Anthropic Partner Basecamp (NTT Data)
+**Audiencia:** Arquitectos y desarrolladores del Anthropic Partner Basecamp
 **Idioma:** Código en inglés, texto/slides en español
 **Metodología:** Spec Driven Development (SDD)
 

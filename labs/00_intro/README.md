@@ -1,6 +1,6 @@
 # Lab 00 — Introducción a los Evals
 
-> **Workshop:** Claude Evals Workshop · NTT Data / Anthropic Partner Basecamp
+> **Workshop:** Claude Evals Workshop · Anthropic Partner Basecamp
 > **Tipo:** Slides conceptuales (sin código)
 > **Duración estimada:** 20 minutos
 

@@ -59,7 +59,7 @@ La metadata del kernel en el notebook debe declarar un kernel Python 3 estándar
 
 ---
 
-**Workshop NTT Data · Anthropic Partner Basecamp**
+**Workshop Anthropic Partner Basecamp**
 
 *Claude Evals Workshop — Lab 00: Introducción*
 ```
@@ -278,7 +278,7 @@ Cada lab es autocontenido — puedes ejecutarlo de forma independiente.
 
 ---
 
-*Claude Evals Workshop — NTT Data · Anthropic Partner Basecamp*
+*Claude Evals Workshop — Anthropic Partner Basecamp*
 ```
 
 ## 6. Criterios de aceptación

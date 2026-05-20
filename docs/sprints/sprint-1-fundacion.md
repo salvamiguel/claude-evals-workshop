@@ -230,7 +230,7 @@ README inicial con estructura del workshop, tabla de labs y guia de inicio rapid
 
 Workshop para demostrar el valor de los evals en el SDLC con IA.
 
-**Audiencia:** Arquitectos y desarrolladores del Anthropic Partner Basecamp (NTT Data)
+**Audiencia:** Arquitectos y desarrolladores del Anthropic Partner Basecamp
 **Stack:** Python 3.12 + Jupyter Notebooks, Vite + Vue 3, GitHub Actions
 
 ---

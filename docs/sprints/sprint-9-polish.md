@@ -10,7 +10,7 @@
 
 Este sprint no añade funcionalidad nueva: su propósito es convertir un repositorio que **funciona** en un repositorio que **presenta bien**. La diferencia entre terminar un sprint técnico y estar listo para una demo en vivo es exactamente el contenido de este sprint.
 
-Al finalizar, cualquier arquitecto o dev de NTT Data que llegue al repositorio por primera vez debe poder:
+Al finalizar, cualquier arquitecto o dev que llegue al repositorio por primera vez debe poder:
 
 1. Entender en 30 segundos qué es el workshop y para quién es.
 2. Abrir el devcontainer con un clic y tener el entorno listo.
@@ -71,7 +71,7 @@ El contenido completo que debe tener `README.md` al terminar el sprint:
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/OWNER/claude-evals-workshop)
 
 Workshop práctico para entender cómo integrar evaluaciones de IA (evals) en cada fase del
-SDLC. Diseñado para arquitectos y desarrolladores del **Anthropic Partner Basecamp — NTT Data**.
+SDLC. Diseñado para arquitectos y desarrolladores del **Anthropic Partner Basecamp**.
 
 **Dashboard de resultados:** https://OWNER.github.io/claude-evals-workshop/
 
@@ -322,4 +322,4 @@ El sprint se considera completo cuando:
 - [ ] El checklist de la sección 5 está completo al 100% (todos los ítems verificados)
 - [ ] El flujo de demo completo ha sido probado de principio a fin al menos una vez
 - [ ] No hay issues abiertos de tipo `bug` en el repositorio sin resolver
-- [ ] El repo está listo para presentar al grupo de NTT Data sin intervención adicional
+- [ ] El repo está listo para presentar al grupo sin intervención adicional
