@@ -1,6 +1,10 @@
 {
-    "recommendations": [
-        "ms-toolsai.jupyter",
-        "ms-toolsai.vscode-jupyter-slideshow"
-    ]
+  "recommendations": [
+    "ms-toolsai.jupyter",
+    "ms-toolsai.vscode-jupyter-slideshow",
+    "ms-python.python",
+    "Vue.volar",
+    "ms-python.black-formatter",
+    "redhat.vscode-yaml"
+  ]
 }
