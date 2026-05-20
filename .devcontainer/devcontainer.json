@@ -4,7 +4,7 @@
   "features": {
     "ghcr.io/devcontainers/features/node:1": { "version": "20" }
   },
-  "postCreateCommand": "pip install anthropic python-dotenv pyyaml && cd dashboard && npm install",
+  "postCreateCommand": "pip install anthropic python-dotenv pyyaml && ([ -f dashboard/package.json ] && (cd dashboard && npm install) || echo 'dashboard not yet scaffolded, skipping npm install')",
   "customizations": {
     "vscode": {
       "extensions": [
