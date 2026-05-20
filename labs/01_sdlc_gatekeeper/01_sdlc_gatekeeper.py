@@ -1,18 +1,22 @@
-"""SDLC Gatekeeper — headless CLI for GitHub Actions.
+"""SDLC Gatekeeper — headless CLI eval for GitHub Actions.
+
+SUT: a Claude agent that receives codebase files + SDLC rules and responds
+with a structured JSON decision (GO/NO-GO) + list of violations.
+
+The eval compares the agent output against a golden dataset.
 
 Usage:
-    python 01_sdlc_gatekeeper.py --file <path> [--model <model_id>] [--rules <path>] [--output <path>]
+    python 01_sdlc_gatekeeper.py [--case CASE_ID] [--model MODEL_ID] \\
+        [--rules PATH] [--prompt PATH] [--golden PATH] [--output PATH]
 
-Exits with code 1 if the decision is NO-GO (any rule fails).
+Exits with code 1 if overall_pass is False.
 """
 import argparse
-import ast
 import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
@@ -22,417 +26,447 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv not required; env vars must be set manually
+    pass
 
 
-# ── Data model ────────────────────────────────────────────────────────────────
+# ── Pricing ───────────────────────────────────────────────────────────────────
 
-@dataclass
-class EvalResult:
-    rule_id: str
-    type: str
-    passed: bool
-    evidence: str
-    score: float
-
-
-# ── Exact Match Evaluator ─────────────────────────────────────────────────────
-
-class ExactMatchEvaluator:
-    """Checks for forbidden or required literal patterns in source code."""
-
-    def evaluate(self, rule: dict, source_code: str) -> EvalResult:
-        pattern = rule["pattern"]
-        match_type = rule.get("match_type", "forbidden")
-        lines = source_code.splitlines()
-
-        matches = [
-            f"Line {i + 1}: {line.strip()}"
-            for i, line in enumerate(lines)
-            if pattern in line
-        ]
-
-        if match_type == "forbidden":
-            passed = len(matches) == 0
-            evidence = matches[0] if matches else "No violations found"
-        else:  # required
-            passed = len(matches) > 0
-            evidence = matches[0] if matches else f"Required pattern '{pattern}' not found"
-
-        return EvalResult(
-            rule_id=rule["id"],
-            type="exact_match",
-            passed=passed,
-            evidence=evidence,
-            score=1.0 if passed else 0.0,
-        )
-
-
-# ── AST Visitors ──────────────────────────────────────────────────────────────
-
-class MagicNumberVisitor(ast.NodeVisitor):
-    """Collects numeric literals that appear outside named constant assignments."""
-
-    ALLOWED_VALUES = {0, 1, -1}
-
-    def __init__(self):
-        self.violations: list[tuple[int, float]] = []
-        self._in_assignment = False
-
-    def visit_Assign(self, node: ast.Assign):
-        self._in_assignment = True
-        self.generic_visit(node)
-        self._in_assignment = False
-
-    def visit_AnnAssign(self, node: ast.AnnAssign):
-        self._in_assignment = True
-        self.generic_visit(node)
-        self._in_assignment = False
-
-    def visit_Constant(self, node: ast.Constant):
-        if (
-            isinstance(node.value, (int, float))
-            and not self._in_assignment
-            and node.value not in self.ALLOWED_VALUES
-        ):
-            self.violations.append((node.lineno, node.value))
-
-
-class ImportVisitor(ast.NodeVisitor):
-    """Collects forbidden module imports."""
-
-    def __init__(self, forbidden: list[str]):
-        self.forbidden = forbidden
-        self.violations: list[tuple[int, str]] = []
-
-    def visit_Import(self, node: ast.Import):
-        for alias in node.names:
-            if any(alias.name.startswith(f) for f in self.forbidden):
-                self.violations.append((node.lineno, alias.name))
-
-    def visit_ImportFrom(self, node: ast.ImportFrom):
-        if node.module and any(node.module.startswith(f) for f in self.forbidden):
-            self.violations.append((node.lineno, node.module))
-
-
-class BareExceptVisitor(ast.NodeVisitor):
-    """Collects bare except clauses (no exception type specified)."""
-
-    def __init__(self):
-        self.violations: list[int] = []
-
-    def visit_ExceptHandler(self, node: ast.ExceptHandler):
-        if node.type is None:
-            self.violations.append(node.lineno)
-        self.generic_visit(node)
-
-
-class FunctionArgVisitor(ast.NodeVisitor):
-    """Collects functions that exceed the maximum allowed argument count."""
-
-    def __init__(self, max_args: int):
-        self.max_args = max_args
-        self.violations: list[tuple[int, str, int]] = []
-
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        arg_count = len(node.args.args)
-        if arg_count > self.max_args:
-            self.violations.append((node.lineno, node.name, arg_count))
-        self.generic_visit(node)
-
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-
-# ── Rule-Based Evaluator ──────────────────────────────────────────────────────
-
-class RuleBasedEvaluator:
-    """Evaluates rules that require AST-level analysis."""
-
-    def evaluate(self, rule: dict, source_code: str) -> EvalResult:
-        try:
-            tree = ast.parse(source_code)
-        except SyntaxError as exc:
-            return EvalResult(
-                rule_id=rule["id"],
-                type="rule_based",
-                passed=False,
-                evidence=f"Syntax error: cannot parse file — {exc}",
-                score=0.0,
-            )
-
-        rule_id = rule["id"]
-
-        if rule_id == "no_magic_numbers":
-            return self._check_magic_numbers(rule, tree)
-        elif rule_id == "use_internal_db":
-            return self._check_forbidden_imports(rule, tree)
-        elif rule_id == "no_bare_except":
-            return self._check_bare_except(rule, tree)
-        elif rule_id == "max_function_args":
-            return self._check_function_args(rule, tree)
-        else:
-            return EvalResult(
-                rule_id=rule_id,
-                type="rule_based",
-                passed=True,
-                evidence=f"No handler implemented for rule '{rule_id}'",
-                score=1.0,
-            )
-
-    def _check_magic_numbers(self, rule: dict, tree: ast.AST) -> EvalResult:
-        visitor = MagicNumberVisitor()
-        visitor.visit(tree)
-        passed = len(visitor.violations) == 0
-        if passed:
-            evidence = "No magic numbers found"
-        else:
-            line, value = visitor.violations[0]
-            evidence = f"Line {line}: magic number {value} found outside named assignment"
-        return EvalResult(
-            rule_id=rule["id"],
-            type="rule_based",
-            passed=passed,
-            evidence=evidence,
-            score=1.0 if passed else 0.0,
-        )
-
-    def _check_forbidden_imports(self, rule: dict, tree: ast.AST) -> EvalResult:
-        forbidden = rule.get("forbidden_imports", [])
-        visitor = ImportVisitor(forbidden)
-        visitor.visit(tree)
-        passed = len(visitor.violations) == 0
-        if passed:
-            evidence = "No forbidden imports found"
-        else:
-            line, name = visitor.violations[0]
-            evidence = f"Line {line}: forbidden import '{name}'"
-        return EvalResult(
-            rule_id=rule["id"],
-            type="rule_based",
-            passed=passed,
-            evidence=evidence,
-            score=1.0 if passed else 0.0,
-        )
-
-    def _check_bare_except(self, rule: dict, tree: ast.AST) -> EvalResult:
-        visitor = BareExceptVisitor()
-        visitor.visit(tree)
-        passed = len(visitor.violations) == 0
-        if passed:
-            evidence = "No bare except clauses found"
-        else:
-            line = visitor.violations[0]
-            evidence = f"Line {line}: bare except clause — specify exception type"
-        return EvalResult(
-            rule_id=rule["id"],
-            type="rule_based",
-            passed=passed,
-            evidence=evidence,
-            score=1.0 if passed else 0.0,
-        )
-
-    def _check_function_args(self, rule: dict, tree: ast.AST) -> EvalResult:
-        max_args = rule.get("max_args", 5)
-        visitor = FunctionArgVisitor(max_args)
-        visitor.visit(tree)
-        passed = len(visitor.violations) == 0
-        if passed:
-            evidence = f"All functions have {max_args} or fewer arguments"
-        else:
-            line, name, count = visitor.violations[0]
-            evidence = f"Line {line}: function '{name}' has {count} arguments (max {max_args})"
-        return EvalResult(
-            rule_id=rule["id"],
-            type="rule_based",
-            passed=passed,
-            evidence=evidence,
-            score=1.0 if passed else 0.0,
-        )
-
-
-# ── LLM-as-Judge Evaluator ────────────────────────────────────────────────────
-
-JUDGE_SYSTEM_PROMPT = """You are a strict code quality reviewer acting as an automated SDLC gate.
-You will receive source code and a specific quality criterion to evaluate.
-You must respond ONLY with a valid JSON object — no prose, no markdown.
-
-Response schema:
-{
-  "score": <float 0.0-10.0>,
-  "passed": <bool>,
-  "evidence": "<one concrete sentence citing line numbers if applicable>"
+PRICING = {
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-7": (15.00, 75.00),
 }
 
-Scoring: 10.0 = zero violations, 0.0 = severe/multiple violations.
-The 'passed' field is true when score >= the provided threshold."""
+
+def cost_usd(model: str, tin: int, tout: int) -> float:
+    pin, pout = PRICING.get(model, (3.00, 15.00))
+    return round((tin * pin + tout * pout) / 1_000_000, 6)
 
 
-def _build_judge_prompt(rule: dict, source_code: str) -> str:
-    return f"""Evaluate the following Python code against this criterion:
+# ── JSON extraction ───────────────────────────────────────────────────────────
 
-CRITERION: {rule['description']}
-SCORE_THRESHOLD: {rule['score_threshold']}
-
-DETAILS:
-{rule['criteria']}
-
-SOURCE CODE:
-```python
-{source_code}
-```
-
-Respond with the JSON schema only."""
-
-
-class LLMJudgeEvaluator:
-    """Evaluates rules using Claude as a semantic code reviewer."""
-
-    def __init__(self, client: anthropic.Anthropic, model: str = "claude-sonnet-4-6"):
-        self.client = client
-        self.model = model
-
-    def evaluate(self, rule: dict, source_code: str) -> EvalResult:
-        prompt = _build_judge_prompt(rule, source_code)
-        try:
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=256,
-                system=JUDGE_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = message.content[0].text
-        except anthropic.RateLimitError:
-            time.sleep(30)
-            message = self.client.messages.create(
-                model=self.model,
-                max_tokens=256,
-                system=JUDGE_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = message.content[0].text
-        except anthropic.APIError as exc:
-            raise RuntimeError(f"Anthropic API error on rule {rule['id']}: {exc}") from exc
-
-        try:
-            parsed = json.loads(raw)
-            score = float(parsed["score"])
-            passed = bool(parsed["passed"])
-            evidence = str(parsed["evidence"])
-        except (json.JSONDecodeError, KeyError):
-            return EvalResult(
-                rule_id=rule["id"],
-                type="llm_judge",
-                passed=False,
-                evidence=f"LLM returned non-JSON response: {raw[:100]}",
-                score=0.0,
-            )
-
-        return EvalResult(
-            rule_id=rule["id"],
-            type="llm_judge",
-            passed=passed,
-            evidence=evidence,
-            score=score,
-        )
-
-
-# ── Pipeline ──────────────────────────────────────────────────────────────────
-
-class GatekeeperPipeline:
-    """Orchestrates all three evaluator types and produces a GO/NO-GO decision."""
-
-    def __init__(self, rules: list[dict], model: str = "claude-sonnet-4-6"):
-        self.rules = rules
-        self.model = model
-        self.exact_evaluator = ExactMatchEvaluator()
-        self.rule_evaluator = RuleBasedEvaluator()
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise EnvironmentError(
-                "ANTHROPIC_API_KEY environment variable is not set. "
-                "Export it or create a .env file with ANTHROPIC_API_KEY=<your-key>."
-            )
-        self._client = anthropic.Anthropic(api_key=api_key)
-        self.llm_evaluator = LLMJudgeEvaluator(self._client, model)
-
-    def run(self, file_path: str) -> dict:
-        source_code = Path(file_path).read_text(encoding="utf-8")
-        results: list[EvalResult] = []
-
-        for rule in self.rules:
-            rule_type = rule["type"]
-            if rule_type == "exact_match":
-                result = self.exact_evaluator.evaluate(rule, source_code)
-            elif rule_type == "rule_based":
-                result = self.rule_evaluator.evaluate(rule, source_code)
-            elif rule_type == "llm_judge":
-                result = self.llm_evaluator.evaluate(rule, source_code)
-            else:
-                result = EvalResult(
-                    rule_id=rule["id"],
-                    type=rule_type,
-                    passed=True,
-                    evidence=f"Unknown rule type '{rule_type}' — skipped",
-                    score=1.0,
-                )
-            results.append(result)
-
-        failed = [r for r in results if not r.passed]
-        passed_list = [r for r in results if r.passed]
-        aggregate_score = sum(r.score for r in results) / len(results) if results else 0.0
-
+def extract_json(text: str) -> dict:
+    """Robustly parse JSON from agent output, handling markdown fences."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
         return {
-            "run_id": datetime.utcnow().isoformat() + "Z",
-            "file": str(file_path),
-            "model": self.model,
-            "results": [asdict(r) for r in results],
-            "decision": "GO" if not failed else "NO-GO",
-            "passed_rules": len(passed_list),
-            "failed_rules": len(failed),
-            "aggregate_score": round(aggregate_score, 2),
+            "decision": "NO-GO",
+            "violations": [],
+            "reasoning": f"PARSE_ERROR: {text[:200]}",
         }
 
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+# ── Loaders ───────────────────────────────────────────────────────────────────
 
-def _load_rules(rules_path: str) -> list[dict]:
-    path = Path(rules_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Rules file not found: {rules_path}")
-    with path.open("r", encoding="utf-8") as fh:
+def _find_repo_root(start: Path) -> Path:
+    """Walk up from start until config/rules.yaml is found."""
+    for candidate in [start, *start.parents]:
+        if (candidate / "config" / "rules.yaml").exists():
+            return candidate
+    return start
+
+
+def load_rules(rules_path: Path) -> list[dict]:
+    with rules_path.open("r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     return data["rules"]
 
 
+def load_golden(golden_path: Path) -> list[dict]:
+    with golden_path.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    return data["test_cases"]
+
+
+def load_prompt_template(prompt_path: Path) -> str:
+    return prompt_path.read_text(encoding="utf-8")
+
+
+def read_codebase(repo_path: Path) -> str:
+    """Read all .py files in repo_path; serialize as fenced blocks."""
+    parts = []
+    for py_file in sorted(repo_path.glob("*.py")):
+        content = py_file.read_text(encoding="utf-8")
+        parts.append(f"## file: {py_file.name}\n```python\n{content}\n```")
+    return "\n\n".join(parts)
+
+
+def serialize_rules(rules: list[dict]) -> str:
+    """Format rules as a readable block for the agent prompt."""
+    lines = []
+    for rule in rules:
+        lines.append(f"- id: {rule['id']}")
+        lines.append(f"  description: {rule['description']}")
+        if "criteria" in rule:
+            criteria_lines = rule["criteria"].strip().replace("\n", "\n      ")
+            lines.append(f"  criteria: {criteria_lines}")
+        if "pattern" in rule:
+            lines.append(f"  pattern: {rule['pattern']} (forbidden)")
+        if "forbidden_imports" in rule:
+            lines.append(f"  forbidden_imports: {rule['forbidden_imports']}")
+        if "max_args" in rule:
+            lines.append(f"  max_args: {rule['max_args']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ── Agent call with streaming ─────────────────────────────────────────────────
+
+def run_agent(client: anthropic.Anthropic, model: str, prompt: str) -> tuple[dict, dict]:
+    """Call the agent with streaming; return (agent_output_dict, perf_metrics)."""
+    ttft = None
+    start = time.perf_counter()
+
+    with client.messages.stream(
+        model=model,
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        for event in stream:
+            if ttft is None and event.type == "content_block_start":
+                ttft = time.perf_counter() - start
+        final_msg = stream.get_final_message()
+
+    ttc = time.perf_counter() - start
+    text = "".join(b.text for b in final_msg.content if hasattr(b, "text"))
+
+    usage = final_msg.usage
+    input_tokens = usage.input_tokens
+    output_tokens = usage.output_tokens
+    total_tokens = input_tokens + output_tokens
+
+    ttft_ms = round((ttft or ttc) * 1000, 1)
+    ttc_ms = round(ttc * 1000, 1)
+    delta_s = max((ttc - (ttft or ttc)), 0.001)
+    otps = round(output_tokens / delta_s, 1)
+
+    perf = {
+        "ttft_ms": ttft_ms,
+        "ttc_ms": ttc_ms,
+        "otps": otps,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": cost_usd(model, input_tokens, output_tokens),
+    }
+
+    agent_output = extract_json(text)
+    return agent_output, perf
+
+
+# ── Quality metrics ───────────────────────────────────────────────────────────
+
+def compute_quality(agent_output: dict, expected: dict) -> dict:
+    """Compute TP/FP/FN and precision/recall/F1 vs expected violations."""
+    agent_violations = agent_output.get("violations", [])
+    expected_violations = expected.get("expected_violations", [])
+
+    agent_rule_ids = {v["rule_id"] for v in agent_violations}
+    expected_rule_ids = {v["rule_id"] for v in expected_violations}
+
+    tp = len(agent_rule_ids & expected_rule_ids)
+    fp = len(agent_rule_ids - expected_rule_ids)
+    fn = len(expected_rule_ids - agent_rule_ids)
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else (1.0 if tp == 0 and fn == 0 else 0.0)
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 1.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    decision_match = agent_output.get("decision") == expected.get("expected_decision")
+
+    return {
+        "decision_match": decision_match,
+        "true_positives": tp,
+        "false_positives": fp,
+        "false_negatives": fn,
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+    }
+
+
+# ── Evaluators ────────────────────────────────────────────────────────────────
+
+class ExactMatchEvaluator:
+    """For each expected_violation.rule_id, verify it appears in agent violations."""
+
+    name = "exact_match"
+
+    def evaluate(self, agent_output: dict, expected: dict) -> dict:
+        agent_rule_ids = {v["rule_id"] for v in agent_output.get("violations", [])}
+        expected_violations = expected.get("expected_violations", [])
+
+        missing = [
+            v["rule_id"]
+            for v in expected_violations
+            if v["rule_id"] not in agent_rule_ids
+        ]
+
+        passed = len(missing) == 0
+        return {
+            "name": self.name,
+            "passed": passed,
+            "score": 1.0 if passed else round(
+                (len(expected_violations) - len(missing)) / max(len(expected_violations), 1), 4
+            ),
+            "evidence": (
+                "All expected rule_ids present in agent output"
+                if passed
+                else f"Missing rule_ids: {missing}"
+            ),
+        }
+
+
+class RuleBasedEvaluator:
+    """Validates the JSON schema of agent output."""
+
+    name = "rule_based"
+
+    def evaluate(self, agent_output: dict, _expected: dict) -> dict:
+        errors = []
+
+        decision = agent_output.get("decision")
+        if decision not in ("GO", "NO-GO"):
+            errors.append(f"decision must be GO or NO-GO, got: {decision!r}")
+
+        violations = agent_output.get("violations")
+        if not isinstance(violations, list):
+            errors.append(f"violations must be a list, got: {type(violations).__name__}")
+        else:
+            for i, v in enumerate(violations):
+                for field in ("rule_id", "file"):
+                    if field not in v:
+                        errors.append(f"violations[{i}] missing field '{field}'")
+
+        if "reasoning" not in agent_output:
+            errors.append("missing 'reasoning' field")
+
+        passed = len(errors) == 0
+        return {
+            "name": self.name,
+            "passed": passed,
+            "score": 1.0 if passed else 0.0,
+            "evidence": "Schema valid" if passed else "; ".join(errors),
+        }
+
+
+LLM_JUDGE_PROMPT = """\
+You are evaluating the reasoning of an SDLC gatekeeper agent.
+
+The agent reviewed code and produced this reasoning:
+"{agent_reasoning}"
+
+The agent's decision was: {agent_decision}
+The expected decision was: {expected_decision}
+The actual violations found vs expected: TP={tp}, FP={fp}, FN={fn}
+
+Rate the reasoning from 0-10 on whether it correctly justifies the decision.
+Respond ONLY with JSON: {{"score": <float>, "passed": <bool>, "reason": "..."}}
+Pass threshold: score >= 6.0\
+"""
+
+
+class LLMJudgeEvaluator:
+    """Uses Claude to evaluate the quality of the agent's reasoning."""
+
+    name = "llm_judge"
+
+    def __init__(self, client: anthropic.Anthropic, model: str):
+        self.client = client
+        self.model = model
+
+    def evaluate(self, agent_output: dict, expected: dict, quality: dict) -> dict:
+        prompt = LLM_JUDGE_PROMPT.format(
+            agent_reasoning=agent_output.get("reasoning", ""),
+            agent_decision=agent_output.get("decision", ""),
+            expected_decision=expected.get("expected_decision", ""),
+            tp=quality["true_positives"],
+            fp=quality["false_positives"],
+            fn=quality["false_negatives"],
+        )
+        try:
+            msg = self.client.messages.create(
+                model=self.model,
+                max_tokens=256,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = msg.content[0].text
+            parsed = extract_json(raw)
+            score = float(parsed.get("score", 0.0))
+            passed = bool(parsed.get("passed", score >= 6.0))
+            reason = str(parsed.get("reason", ""))
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "name": self.name,
+                "passed": False,
+                "score": 0.0,
+                "evidence": f"Judge error: {exc}",
+            }
+
+        return {
+            "name": self.name,
+            "passed": passed,
+            "score": round(score, 2),
+            "evidence": reason,
+        }
+
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+
+def run_case(
+    client: anthropic.Anthropic,
+    model: str,
+    case: dict,
+    rules: list[dict],
+    prompt_template: str,
+    repo_root: Path,
+) -> dict:
+    """Run the agent on one test case and return the full case result."""
+    repo_path = repo_root / case["repo_path"]
+    codebase = read_codebase(repo_path)
+    rules_text = serialize_rules(rules)
+
+    prompt = prompt_template.replace("{rules}", rules_text).replace("{codebase}", codebase)
+
+    print(f"  Running case: {case['case_id']} ...", file=sys.stderr, flush=True)
+    agent_output, perf = run_agent(client, model, prompt)
+
+    quality = compute_quality(agent_output, case)
+
+    exact_eval = ExactMatchEvaluator()
+    rule_eval = RuleBasedEvaluator()
+    llm_eval = LLMJudgeEvaluator(client, model)
+
+    exact_result = exact_eval.evaluate(agent_output, case)
+    rule_result = rule_eval.evaluate(agent_output, case)
+    llm_result = llm_eval.evaluate(agent_output, case, quality)
+
+    print(
+        f"    -> decision_match={quality['decision_match']} "
+        f"f1={quality['f1']} "
+        f"ttft={perf['ttft_ms']}ms cost=${perf['cost_usd']}",
+        file=sys.stderr,
+    )
+
+    return {
+        "case_id": case["case_id"],
+        "agent_output": agent_output,
+        "quality": quality,
+        "performance": perf,
+        "evaluators": [exact_result, rule_result, llm_result],
+    }
+
+
+# ── Aggregation ───────────────────────────────────────────────────────────────
+
+def aggregate(test_cases: list[dict]) -> dict:
+    n = len(test_cases)
+    if n == 0:
+        return {
+            "overall_pass": False,
+            "avg_precision": 0.0,
+            "avg_recall": 0.0,
+            "avg_f1": 0.0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost_usd": 0.0,
+            "total_ttft_ms": 0.0,
+        }
+
+    avg_precision = round(sum(c["quality"]["precision"] for c in test_cases) / n, 4)
+    avg_recall = round(sum(c["quality"]["recall"] for c in test_cases) / n, 4)
+    avg_f1 = round(sum(c["quality"]["f1"] for c in test_cases) / n, 4)
+    all_decision_match = all(c["quality"]["decision_match"] for c in test_cases)
+
+    overall_pass = avg_f1 >= 0.7 and all_decision_match
+
+    return {
+        "overall_pass": overall_pass,
+        "avg_precision": avg_precision,
+        "avg_recall": avg_recall,
+        "avg_f1": avg_f1,
+        "total_input_tokens": sum(c["performance"]["input_tokens"] for c in test_cases),
+        "total_output_tokens": sum(c["performance"]["output_tokens"] for c in test_cases),
+        "total_cost_usd": round(sum(c["performance"]["cost_usd"] for c in test_cases), 6),
+        "total_ttft_ms": round(sum(c["performance"]["ttft_ms"] for c in test_cases), 1),
+    }
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="SDLC Gatekeeper — automated code quality gate for CI/CD pipelines"
+        description="SDLC Gatekeeper — eval a Claude agent against a golden dataset"
+    )
+    parser.add_argument("--case", default=None, help="Case ID to run (default: all)")
+    parser.add_argument("--model", default="claude-sonnet-4-6", help="Anthropic model ID")
+    parser.add_argument("--rules", default="config/rules.yaml", help="Path to rules YAML")
+    parser.add_argument(
+        "--prompt",
+        default="labs/01_sdlc_gatekeeper/agent_prompt.md",
+        help="Path to agent prompt template",
     )
     parser.add_argument(
-        "--file",
-        required=True,
-        help="Path to the Python source file to evaluate",
+        "--golden",
+        default="examples/test_repos/golden_dataset.yaml",
+        help="Path to golden dataset YAML",
     )
-    parser.add_argument(
-        "--model",
-        default="claude-sonnet-4-6",
-        help="Anthropic model ID to use for LLM-as-Judge rules (default: claude-sonnet-4-6)",
-    )
-    parser.add_argument(
-        "--rules",
-        default="config/rules.yaml",
-        help="Path to the rules YAML file (default: config/rules.yaml)",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Optional path to save the JSON result (default: print to stdout only)",
-    )
+    parser.add_argument("--output", default=None, help="Optional path to save JSON result")
     args = parser.parse_args()
 
-    rules = _load_rules(args.rules)
-    pipeline = GatekeeperPipeline(rules=rules, model=args.model)
-    report = pipeline.run(args.file)
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print(
+            "ERROR: ANTHROPIC_API_KEY environment variable is not set.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    client = anthropic.Anthropic(api_key=api_key)
+    repo_root = _find_repo_root(Path(args.rules).resolve().parent)
+
+    rules = load_rules(Path(args.rules))
+    prompt_template = load_prompt_template(Path(args.prompt))
+    all_cases = load_golden(Path(args.golden))
+
+    if args.case:
+        cases = [c for c in all_cases if c["case_id"] == args.case]
+        if not cases:
+            print(
+                f"ERROR: Case '{args.case}' not found. "
+                f"Available: {[c['case_id'] for c in all_cases]}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    else:
+        cases = all_cases
+
+    print(f"Model: {args.model}", file=sys.stderr)
+    print(f"Cases: {[c['case_id'] for c in cases]}", file=sys.stderr)
+    print(f"Rules: {len(rules)} loaded", file=sys.stderr)
+
+    results = []
+    for case in cases:
+        result = run_case(client, args.model, case, rules, prompt_template, repo_root)
+        results.append(result)
+
+    agg = aggregate(results)
+
+    report = {
+        "run_id": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "lab": "lab01",
+        "model": args.model,
+        "test_cases": results,
+        "aggregate": agg,
+    }
 
     output_json = json.dumps(report, indent=2)
     print(output_json)
@@ -441,8 +475,9 @@ def main() -> None:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(output_json, encoding="utf-8")
+        print(f"Result saved to: {args.output}", file=sys.stderr)
 
-    if report["decision"] == "NO-GO":
+    if not agg["overall_pass"]:
         sys.exit(1)
 
 

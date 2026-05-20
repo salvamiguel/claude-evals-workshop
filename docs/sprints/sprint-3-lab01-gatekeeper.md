@@ -1,22 +1,24 @@
 # Sprint 3 — Lab 01: SDLC Gatekeeper
 
-**Sprint**: 3 de 5  
-**Lab**: 01 — SDLC Gatekeeper  
-**Fecha**: 2026-05-20  
+**Sprint**: 3 de 9
+**Lab**: 01 — SDLC Gatekeeper
+**Fecha**: 2026-05-20
 **Estado**: Por implementar
 
 ---
 
 ## 1. Objetivo del sprint
 
-Construir el **Lab 01: SDLC Gatekeeper**, un evaluador automatizado que actúa como guardián de calidad de código en un pipeline CI/CD real. El lab demuestra tres estrategias de evaluación complementarias —Exact Match, Rule-Based y LLM-as-Judge— y enseña a los participantes cuándo y por qué usar cada una.
+Construir un **eval sobre un agente Claude que actúa como gatekeeper SDLC**. El agente recibe un codebase y devuelve un veredicto (GO/NO-GO + lista de violaciones); el lab mide si el agente hace bien ese trabajo comparando su output con un golden dataset.
 
 Al finalizar el sprint, el participante habrá:
 
-- Implementado los tres tipos de evaluador en Python dentro de un notebook autocontenido.
-- Ejecutado el gatekeeper contra código real (`good_code` y `bad_code`) y obtenido un JSON con decisión GO / NO-GO.
-- Comprendido el rol del LLM como juez de alta semántica frente a chequeadores deterministas.
-- Conectado el lab al workflow de GitHub Actions que lo ejecuta en CI/CD.
+- Construido el prompt del **agente gatekeeper** inyectando las reglas SDLC desde `rules.yaml`.
+- Ejecutado el agente sobre dos test repos (uno con violaciones, otro limpio) usando streaming para capturar TTFT/TTC.
+- Calculado métricas de **calidad** (precision, recall, F1, decision match) sobre el output del agente.
+- Calculado métricas de **performance** (TTFT, TTC, OTPS, tokens, coste) por ejecución.
+- Aplicado 3 evaluadores (Exact Match, Rule-Based, LLM-as-Judge) sobre el output del agente.
+- Comprendido el patrón de eval correcto: **medir el comportamiento del agente IA**, no analizar archivos estáticos.
 
 ---
 
@@ -24,11 +26,10 @@ Al finalizar el sprint, el participante habrá:
 
 | Requisito | Descripción |
 |-----------|-------------|
-| Sprint 1 completo | Estructura de directorios base creada: `labs/`, `examples/`, `config/`, `.github/` |
-| Sprint 2 completo | GitHub Actions configurado con `model_id` y `lab_id`; resultados se guardan en `results/` |
-| API Key de Anthropic | Disponible como `ANTHROPIC_API_KEY` en el entorno (envar o secret de GitHub) |
-| Python 3.12 | Con `pip install anthropic pyyaml` disponible en el entorno |
-| Jupyter / Codespaces | Compatible con GitHub Codespaces y vscode.dev (sin servidor local requerido) |
+| Sprint 1 completo | Estructura base creada (`labs/`, `examples/`, `config/`) |
+| API Key de Anthropic | Disponible como `ANTHROPIC_API_KEY` |
+| Python 3.12 | Con `anthropic`, `pyyaml`, `python-dotenv` |
+| Jupyter / Codespaces | Compatible con el devcontainer |
 
 ---
 
@@ -36,614 +37,366 @@ Al finalizar el sprint, el participante habrá:
 
 | Ruta | Tipo | Descripción |
 |------|------|-------------|
-| `config/rules.yaml` | YAML | Definición de las 13 reglas SDLC: 4 exact_match, 4 rule_based, 5 llm_judge |
-| `examples/good_code/api_client.py` | Python | Cliente HTTP correcto: usa `httpx_internal`, timeouts, logging, tipado |
-| `examples/good_code/data_processor.py` | Python | Procesador de datos correcto: constantes nombradas, imports aprobados, funciones cohesivas |
-| `examples/good_code/service.py` | Python | Servicio correcto: responsabilidades separadas, secrets en envars, storage en cloud |
-| `examples/bad_code/api_client_bad.py` | Python | Violaciones: `import requests`, print statements, sin timeout, nombres no descriptivos |
-| `examples/bad_code/data_processor_bad.py` | Python | Violaciones: magic numbers, `import *`, imports no aprobados (`psycopg2`), bare except |
-| `examples/bad_code/service_bad.py` | Python | Violaciones: God class, hardcoded secrets, uso de `eval()`, escritura en filesystem local |
-| `labs/01_sdlc_gatekeeper/01_sdlc_gatekeeper.ipynb` | Jupyter | Notebook principal pedagógico con celdas progresivas |
-| `labs/01_sdlc_gatekeeper/01_sdlc_gatekeeper.py` | Python | Versión vanilla sin Jupyter para ejecución en GitHub Actions |
-| `labs/01_sdlc_gatekeeper/requirements.txt` | Text | Dependencias: `anthropic`, `pyyaml` |
+| `config/rules.yaml` | YAML | Existente — fuente de las 13 reglas SDLC. Se inyecta en el prompt del agente. |
+| `examples/test_repos/with_violations/` | dir | Codebase con violaciones conocidas (3-4 archivos `.py`) |
+| `examples/test_repos/clean/` | dir | Codebase correcto (3-4 archivos `.py`) |
+| `examples/test_repos/golden_dataset.yaml` | YAML | Violaciones esperadas por test repo + decisión esperada |
+| `labs/01_sdlc_gatekeeper/agent_prompt.md` | Markdown | Template del prompt del agente con placeholders `{rules}` y `{codebase}` |
+| `labs/01_sdlc_gatekeeper/01_sdlc_gatekeeper.py` | Python | CLI headless para GitHub Actions |
+| `labs/01_sdlc_gatekeeper/01_sdlc_gatekeeper.ipynb` | Jupyter | Notebook pedagógico |
+| `labs/01_sdlc_gatekeeper/requirements.txt` | Text | Existente — `anthropic`, `pyyaml`, `python-dotenv` |
+| `examples/good_code/` | dir | **Solo referencia pedagógica** — mostrado en notebook, no evaluado |
+| `examples/bad_code/` | dir | **Solo referencia pedagógica** — mostrado en notebook, no evaluado |
 
 ---
 
-## 4. Diseño del notebook
+## 4. Diseño del agente y el eval
 
-### Estructura de celdas y progresión pedagógica
-
-El notebook sigue una progresión de **lo simple a lo complejo**: primero evaluadores deterministas (sin LLM), luego el juez semántico, y finalmente el pipeline completo. Cada sección tiene una celda de explicación en Markdown antes del código.
+### 4.1 Concepto
 
 ```
-Celda 01 — Markdown  : Título y objetivo del lab
-Celda 02 — Markdown  : ¿Qué es un SDLC Gatekeeper?
-Celda 03 — Code      : Setup — imports y carga de API Key
-Celda 04 — Markdown  : Sección 1 — Exact Match
-Celda 05 — Code      : Implementación ExactMatchEvaluator
-Celda 06 — Code      : Prueba ExactMatchEvaluator sobre bad_code
-Celda 07 — Markdown  : Sección 2 — Rule-Based (AST)
-Celda 08 — Code      : Implementación RuleBasedEvaluator
-Celda 09 — Code      : Prueba RuleBasedEvaluator sobre bad_code
-Celda 10 — Markdown  : Sección 3 — LLM-as-Judge
-Celda 11 — Code      : Implementación LLMJudgeEvaluator
-Celda 12 — Code      : Prueba LLMJudgeEvaluator sobre bad_code
-Celda 13 — Markdown  : Sección 4 — Pipeline completo
-Celda 14 — Code      : GatekeeperPipeline — orquesta los tres evaluadores
-Celda 15 — Code      : Ejecutar pipeline sobre todo el directorio bad_code/
-Celda 16 — Code      : Mostrar resultados en tabla + decisión GO / NO-GO
-Celda 17 — Code      : Exportar resultado a JSON (formato GitHub Actions)
-Celda 18 — Markdown  : Reflexión — ¿cuándo usar cada tipo de evaluador?
+┌─────────────────────────────────────────────────────────────┐
+│  SUT (Sistema Bajo Prueba) = AGENTE CLAUDE                  │
+│  - Input: contenido del test repo                           │
+│  - Prompt: instrucciones + reglas SDLC inyectadas           │
+│  - Output: JSON {decision, violations[], reasoning}         │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  EL EVAL (lo que construimos en este sprint)                │
+│  - Compara output del agente vs golden_dataset.yaml         │
+│  - Métricas quality: precision, recall, F1, decision_match  │
+│  - Métricas performance: TTFT, TTC, OTPS, tokens, cost      │
+│  - 3 evaluadores sobre el output del agente                 │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Notas pedagógicas por sección
+### 4.2 Template del prompt del agente (`agent_prompt.md`)
 
-**Sección 1 — Exact Match**: El evaluador más simple. Demuestra que no todo requiere un LLM. Un `grep` estructurado es suficiente para reglas de tipo "este token no debe aparecer". Introduce el concepto de `forbidden pattern` vs `required pattern`.
+```markdown
+You are an SDLC Quality Gatekeeper. Your job is to review a codebase and
+identify violations of the rules below. If a single rule is violated,
+the decision is NO-GO.
 
-**Sección 2 — Rule-Based**: Introduce el AST de Python (`ast` stdlib) para análisis semántico sin LLM. La regla `no_magic_numbers` solo se puede implementar correctamente con AST (no con grep, porque `timeout=30` no es un magic number, pero `x = 30` sí). Esto justifica ir más allá de regex.
+## Rules to enforce
 
-**Sección 3 — LLM-as-Judge**: Presenta el patrón de evaluación semántica. Las reglas `no_hardcoded_secrets` o `single_responsibility` requieren comprensión del contexto; un LLM las evalúa mejor que cualquier regex. Se introduce el prompt estructurado con criterios explícitos y `score_threshold`.
+{rules}
 
-**Sección 4 — Pipeline**: Muestra cómo componer los tres evaluadores en un pipeline con decisión binaria. Introduce el concepto de "cualquier falla bloquea el merge" (strictness = AND logic).
+## Codebase to review
 
----
+{codebase}
 
-## 5. Ejemplos de código
+## Response format
 
-### 5.1 `examples/good_code/api_client.py`
+Respond with ONLY a valid JSON object (no markdown fences, no prose).
 
-```python
-"""
-API client using approved internal HTTP library with proper configuration.
-"""
-import logging
-from typing import Any
-
-import httpx_internal
-
-logger = logging.getLogger(__name__)
-
-DEFAULT_TIMEOUT_SECONDS = 10
-MAX_RETRIES = 3
-
-
-def fetch_user_data(user_id: str, base_url: str) -> dict[str, Any]:
-    """Fetch user data from the remote API with timeout and error handling."""
-    url = f"{base_url}/users/{user_id}"
-    try:
-        response = httpx_internal.get(url, timeout=DEFAULT_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        logger.info("Successfully fetched user %s", user_id)
-        return response.json()
-    except httpx_internal.HTTPStatusError as exc:
-        logger.error("HTTP error fetching user %s: %s", user_id, exc)
-        raise
-    except httpx_internal.RequestError as exc:
-        logger.error("Request error fetching user %s: %s", user_id, exc)
-        raise
-```
-
-### 5.2 `examples/good_code/data_processor.py`
-
-```python
-"""
-Data processor using approved internal DB client and named constants.
-"""
-import logging
-from typing import Any
-
-import internal_db_client
-
-logger = logging.getLogger(__name__)
-
-BATCH_SIZE = 100
-MAX_RECORD_AGE_DAYS = 30
-MIN_SCORE_THRESHOLD = 0.75
-
-
-def load_records(table_name: str, limit: int = BATCH_SIZE) -> list[dict[str, Any]]:
-    """Load records from the approved internal DB client."""
-    connection = internal_db_client.connect()
-    return connection.query(f"SELECT * FROM {table_name} LIMIT %s", [limit])
-
-
-def filter_recent_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return only records newer than MAX_RECORD_AGE_DAYS."""
-    from datetime import datetime, timedelta
-    cutoff = datetime.utcnow() - timedelta(days=MAX_RECORD_AGE_DAYS)
-    return [r for r in records if r["created_at"] >= cutoff]
-
-
-def compute_quality_score(record: dict[str, Any]) -> float:
-    """Compute a normalized quality score between 0.0 and 1.0."""
-    completeness = len([v for v in record.values() if v is not None]) / len(record)
-    return round(completeness, 4)
-```
-
-### 5.3 `examples/good_code/service.py`
-
-```python
-"""
-Service layer with separated responsibilities, env-based secrets, and cloud storage.
-"""
-import logging
-import os
-
-import boto3
-
-logger = logging.getLogger(__name__)
-
-_S3_BUCKET = os.environ["STORAGE_BUCKET"]
-_DB_PASSWORD = os.environ["DB_PASSWORD"]
-
-
-class ReportService:
-    """Generates and uploads reports to cloud storage."""
-
-    def __init__(self, s3_client: boto3.client = None) -> None:
-        self._s3 = s3_client or boto3.client("s3")
-
-    def generate_report(self, data: list[dict]) -> bytes:
-        """Transform raw data into a CSV-formatted byte payload."""
-        import csv
-        import io
-        buffer = io.StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=data[0].keys())
-        writer.writeheader()
-        writer.writerows(data)
-        return buffer.getvalue().encode("utf-8")
-
-    def upload_report(self, payload: bytes, report_name: str) -> str:
-        """Upload report bytes to S3 and return the object key."""
-        key = f"reports/{report_name}"
-        self._s3.put_object(Bucket=_S3_BUCKET, Key=key, Body=payload)
-        logger.info("Report uploaded to s3://%s/%s", _S3_BUCKET, key)
-        return key
-```
-
-### 5.4 `examples/bad_code/api_client_bad.py`
-
-Violaciones presentes:
-- `import requests` — librería no aprobada, viola `use_internal_http`
-- `print(...)` — viola `no_print_statements`
-- Sin timeout en la llamada HTTP — viola `external_calls_have_timeout`
-- Variables de una letra (`u`, `b`, `r`) — viola `meaningful_naming`
-
-```python
-# Bad: uses forbidden 'requests' library instead of httpx_internal
-import requests
-
-# Bad: print instead of logging
-print("Starting API client")
-
-# Bad: non-descriptive variable names
-def g(u, b):
-    # Bad: no timeout on HTTP call
-    r = requests.get(b + "/users/" + u)
-    print("Got response:", r.status_code)
-    return r.json()
-```
-
-### 5.5 `examples/bad_code/data_processor_bad.py`
-
-Violaciones presentes:
-- `from datetime import *` — viola `no_wildcard_imports`
-- `import psycopg2` — viola `use_internal_db`
-- Literales `30` y `0.75` en expresiones condicionales — viola `no_magic_numbers`
-- `except:` sin tipo — viola `no_bare_except`
-
-```python
-# Bad: wildcard import pollutes namespace
-from datetime import *
-
-# Bad: forbidden DB library instead of internal_db_client
-import psycopg2
-
-# Bad: magic numbers scattered in logic (30, 0.75)
-def process(records):
-    result = []
-    for r in records:
-        if r["age"] < 30 and r["score"] > 0.75:
-            result.append(r)
-    # Bad: bare except hides errors
-    try:
-        conn = psycopg2.connect("host=localhost dbname=prod")
-        conn.execute("INSERT INTO processed VALUES (%s)", [result])
-    except:
-        pass
-    return result
-```
-
-### 5.6 `examples/bad_code/service_bad.py`
-
-Violaciones presentes:
-- `API_KEY = "sk-prod-abc123secret"` — viola `no_hardcoded_secrets`
-- `open("/tmp/...")` para almacenamiento persistente — viola `use_cloud_native_storage`
-- `'eval'` como función llamada sobre input de usuario — viola `no_dynamic_code_execution` y es vector de inyección
-- God class (`DataManager.do_everything`) — viola `single_responsibility`
-- `import requests` y llamada sin timeout — viola `use_internal_http` y `external_calls_have_timeout`
-
-```python
-# Bad: hardcoded secrets — never store credentials in source code
-API_KEY = "sk-prod-abc123secret"
-DB_PASSWORD = "supersecret123"
-
-# Bad: writes to local filesystem for persistent storage instead of cloud
-def save_report(data, filename):
-    with open(f"/tmp/{filename}", "w") as f:
-        f.write(str(data))
-    print(f"Saved to /tmp/{filename}")
-
-# Bad: God class — mezcla HTTP, DB, business logic y I/O en un solo método
-class DataManager:
-    def do_everything(self, user_expression, filename, url, table):
-        import requests
-        # Bad: no timeout on HTTP call
-        data = requests.get(url).json()
-        # Bad: dynamic code execution on user input — critical security risk
-        # Note: the following line uses eval() intentionally as a bad-code example
-        result = __builtins__['eval'](user_expression)  # noqa: S307
-        save_report(result, filename)
-        return result
-```
-
-> **Nota para el implementador**: al crear el archivo `service_bad.py` real, la línea de dynamic execution debe ser simplemente `result = eval(user_expression)` sin el comentario `noqa`. El `noqa` aquí es solo para que este documento de spec no sea bloqueado por hooks del repo. La regla `no_dynamic_code_execution` debe detectar esa llamada.
-
----
-
-## 6. Diseño de los evaluadores
-
-### 6.1 Exact Match Evaluator
-
-**Estrategia**: búsqueda de tokens literales línea a línea. No requiere LLM ni AST.
-
-**Implementación**:
-```python
-import re
-from dataclasses import dataclass
-
-@dataclass
-class EvalResult:
-    rule_id: str
-    type: str
-    passed: bool
-    evidence: str
-    score: float
-
-
-class ExactMatchEvaluator:
-    """Checks for forbidden or required literal patterns in source code."""
-
-    def evaluate(self, rule: dict, source_code: str) -> EvalResult:
-        pattern = rule["pattern"]
-        match_type = rule.get("match_type", "forbidden")
-        lines = source_code.splitlines()
-
-        matches = [
-            f"Line {i + 1}: {line.strip()}"
-            for i, line in enumerate(lines)
-            if pattern in line
-        ]
-
-        if match_type == "forbidden":
-            passed = len(matches) == 0
-            evidence = matches[0] if matches else "No violations found"
-        else:  # required
-            passed = len(matches) > 0
-            evidence = matches[0] if matches else f"Required pattern '{pattern}' not found"
-
-        return EvalResult(
-            rule_id=rule["id"],
-            type="exact_match",
-            passed=passed,
-            evidence=evidence,
-            score=1.0 if passed else 0.0,
-        )
-```
-
-**Cuándo usar**: reglas donde la presencia/ausencia de un token es suficiente evidencia. Rápido, determinista, sin coste de API.
-
-### 6.2 Rule-Based Evaluator (AST)
-
-**Estrategia**: análisis del AST de Python para detectar patrones semánticos que no se pueden capturar con grep (magic numbers en contexto, conteo de argumentos, imports específicos).
-
-**Implementación clave — detección de magic numbers**:
-```python
-import ast
-
-class MagicNumberVisitor(ast.NodeVisitor):
-    """Visits AST nodes and collects numeric literals outside named assignments."""
-
-    ALLOWED_VALUES = {0, 1, -1}  # Idiomatic constants — skip these
-
-    def __init__(self):
-        self.violations: list[tuple[int, float]] = []  # (line, value)
-        self._in_assignment = False
-
-    def visit_Assign(self, node: ast.Assign):
-        # Allow: MAX_SIZE = 100 (named constant at module/class level)
-        self._in_assignment = True
-        self.generic_visit(node)
-        self._in_assignment = False
-
-    def visit_Constant(self, node: ast.Constant):
-        if (
-            isinstance(node.value, (int, float))
-            and not self._in_assignment
-            and node.value not in self.ALLOWED_VALUES
-        ):
-            self.violations.append((node.lineno, node.value))
-```
-
-**Implementación clave — max function args**:
-```python
-class FunctionArgVisitor(ast.NodeVisitor):
-    def __init__(self, max_args: int):
-        self.max_args = max_args
-        self.violations: list[tuple[int, str, int]] = []  # (line, name, count)
-
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        arg_count = len(node.args.args)
-        if arg_count > self.max_args:
-            self.violations.append((node.lineno, node.name, arg_count))
-        self.generic_visit(node)
-```
-
-**Implementación clave — imports no aprobados**:
-```python
-class ImportVisitor(ast.NodeVisitor):
-    def __init__(self, forbidden: list[str]):
-        self.forbidden = forbidden
-        self.violations: list[tuple[int, str]] = []
-
-    def visit_Import(self, node: ast.Import):
-        for alias in node.names:
-            if any(alias.name.startswith(f) for f in self.forbidden):
-                self.violations.append((node.lineno, alias.name))
-
-    def visit_ImportFrom(self, node: ast.ImportFrom):
-        if node.module and any(node.module.startswith(f) for f in self.forbidden):
-            self.violations.append((node.lineno, node.module))
-```
-
-**Cuándo usar**: reglas que requieren estructura del código (árbol) pero no comprensión semántica. Determinista, rápido, sin coste de API.
-
-### 6.3 LLM-as-Judge Evaluator
-
-**Estrategia**: enviar el código fuente + criterios de evaluación a Claude y obtener una puntuación estructurada con justificación.
-
-**Prompt estructurado**:
-```python
-JUDGE_SYSTEM_PROMPT = """You are a strict code quality reviewer acting as an automated SDLC gate.
-You will receive source code and a specific quality criterion to evaluate.
-You must respond ONLY with a valid JSON object — no prose, no markdown.
-
-Response schema:
+Schema:
 {
-  "score": <float 0.0-10.0>,
-  "passed": <bool>,
-  "evidence": "<one concrete sentence citing line numbers if applicable>"
+  "decision": "GO" | "NO-GO",
+  "violations": [
+    {
+      "rule_id": "<id from the rules above>",
+      "file": "<filename>",
+      "line": <line number or null>,
+      "evidence": "<exact line or quoted reasoning>"
+    }
+  ],
+  "reasoning": "<one paragraph: what you checked and why this decision>"
 }
 
-Scoring: 10.0 = zero violations, 0.0 = severe/multiple violations.
-The 'passed' field is true when score >= the provided threshold."""
-
-def build_judge_prompt(rule: dict, source_code: str) -> str:
-    return f"""Evaluate the following Python code against this criterion:
-
-CRITERION: {rule['description']}
-SCORE_THRESHOLD: {rule['score_threshold']}
-
-DETAILS:
-{rule['criteria']}
-
-SOURCE CODE:
-```python
-{source_code}
+If no violations: violations is an empty list and decision is "GO".
 ```
 
-Respond with the JSON schema only."""
+El placeholder `{rules}` se reemplaza por una serialización legible de `rules.yaml` (no el YAML crudo — un formato amigable para el LLM: `- id: ...\n  description: ...\n  criteria: ...`).
+
+El placeholder `{codebase}` se reemplaza por el contenido concatenado de todos los `.py` del test repo, cada archivo precedido por `## file: <name>` para que el modelo cite el archivo correcto en `violations[].file`.
+
+### 4.3 Test repos
+
+**`examples/test_repos/with_violations/`** — 3 archivos con violaciones distribuidas:
+- `api_client.py` → viola `use_internal_http`, `no_print_statements`, `external_calls_have_timeout`, `meaningful_naming`
+- `data_processor.py` → viola `no_wildcard_imports`, `use_internal_db`, `no_magic_numbers`, `no_bare_except`
+- `service.py` → viola `no_hardcoded_secrets`, `use_cloud_native_storage`, `no_dynamic_code_execution`, `single_responsibility`, `use_internal_http`
+
+**`examples/test_repos/clean/`** — 3 archivos sin violaciones:
+- `api_client.py` → usa `httpx_internal`, timeouts, logging estructurado
+- `data_processor.py` → constantes nombradas, `internal_db_client`, excepciones específicas
+- `service.py` → secrets en envars, S3 para storage, responsabilidades separadas
+
+### 4.4 Golden dataset (`examples/test_repos/golden_dataset.yaml`)
+
+```yaml
+test_cases:
+  - case_id: with_violations
+    repo_path: examples/test_repos/with_violations
+    expected_decision: NO-GO
+    expected_violations:
+      - { rule_id: use_internal_http,           file: api_client.py }
+      - { rule_id: no_print_statements,         file: api_client.py }
+      - { rule_id: external_calls_have_timeout, file: api_client.py }
+      - { rule_id: meaningful_naming,           file: api_client.py }
+      - { rule_id: no_wildcard_imports,         file: data_processor.py }
+      - { rule_id: use_internal_db,             file: data_processor.py }
+      - { rule_id: no_magic_numbers,            file: data_processor.py }
+      - { rule_id: no_bare_except,              file: data_processor.py }
+      - { rule_id: no_hardcoded_secrets,        file: service.py }
+      - { rule_id: use_cloud_native_storage,    file: service.py }
+      - { rule_id: no_dynamic_code_execution,   file: service.py }
+      - { rule_id: single_responsibility,       file: service.py }
+      - { rule_id: use_internal_http,           file: service.py }
+
+  - case_id: clean
+    repo_path: examples/test_repos/clean
+    expected_decision: GO
+    expected_violations: []
 ```
-
-**Llamada al API**:
-```python
-import anthropic
-import json
-
-client = anthropic.Anthropic()
-
-def evaluate_with_llm(rule: dict, source_code: str, model: str = "claude-sonnet-4-6") -> EvalResult:
-    message = client.messages.create(
-        model=model,
-        max_tokens=256,
-        system=JUDGE_SYSTEM_PROMPT,
-        messages=[
-            {"role": "user", "content": build_judge_prompt(rule, source_code)}
-        ],
-    )
-    raw = message.content[0].text
-    parsed = json.loads(raw)
-    return EvalResult(
-        rule_id=rule["id"],
-        type="llm_judge",
-        passed=parsed["passed"],
-        evidence=parsed["evidence"],
-        score=float(parsed["score"]),
-    )
-```
-
-**Cuándo usar**: reglas que requieren comprensión semántica o de intención (¿este string parece una API key? ¿esta función hace demasiadas cosas?). Flexible pero con coste de latencia y dinero.
-
-### 6.4 Composición — GatekeeperPipeline
-
-```python
-from pathlib import Path
-from datetime import datetime
-
-class GatekeeperPipeline:
-    """Orchestrates all three evaluator types and produces a GO/NO-GO decision."""
-
-    def __init__(self, rules: list[dict], model: str = "claude-sonnet-4-6"):
-        self.rules = rules
-        self.model = model
-        self.exact_evaluator = ExactMatchEvaluator()
-        self.rule_evaluator = RuleBasedEvaluator()
-
-    def run(self, file_path: str) -> dict:
-        source_code = Path(file_path).read_text()
-        results = []
-
-        for rule in self.rules:
-            if rule["type"] == "exact_match":
-                result = self.exact_evaluator.evaluate(rule, source_code)
-            elif rule["type"] == "rule_based":
-                result = self.rule_evaluator.evaluate(rule, source_code)
-            elif rule["type"] == "llm_judge":
-                result = evaluate_with_llm(rule, source_code, self.model)
-            results.append(result)
-
-        failed = [r for r in results if not r.passed]
-        passed_list = [r for r in results if r.passed]
-        aggregate_score = sum(r.score for r in results) / len(results)
-
-        return {
-            "run_id": datetime.utcnow().isoformat() + "Z",
-            "file": str(file_path),
-            "model": self.model,
-            "results": [vars(r) for r in results],
-            "decision": "GO" if not failed else "NO-GO",
-            "passed_rules": len(passed_list),
-            "failed_rules": len(failed),
-            "aggregate_score": round(aggregate_score, 2),
-        }
-```
-
-**Decisión**: `NO-GO` si **cualquier** regla falla — lógica AND estricta, coherente con un gate de CI/CD real.
 
 ---
 
-## 7. Criterios de aceptación
+## 5. Métricas del eval
+
+### 5.1 Quality (sobre el output del agente)
+
+| Métrica | Fórmula | Significado |
+|---------|---------|-------------|
+| `decision_match` | `agent.decision == expected.decision` | El agente acertó GO/NO-GO |
+| `true_positives (TP)` | Violaciones reportadas que **están** en el golden | Detecciones correctas |
+| `false_positives (FP)` | Violaciones reportadas que **NO están** en el golden | Alucinaciones |
+| `false_negatives (FN)` | Violaciones esperadas que **NO reportó** el agente | Escapes |
+| `precision` | TP / (TP + FP) | ¿Cuántas de sus detecciones son ciertas? |
+| `recall` | TP / (TP + FN) | ¿Cuántas violaciones reales detecta? |
+| `f1` | 2 · precision · recall / (precision + recall) | Media armónica |
+
+Para hacer match de violaciones, comparar `(rule_id, file)` ignorando `line` (el agente puede no acertar la línea exacta).
+
+### 5.2 Performance (basadas en `Basecamp-Exercises/day2/02_inference-optimization`)
+
+| Métrica | Cómo |
+|---------|------|
+| `ttft_ms` | Tiempo hasta el primer `content_block_start` event con streaming |
+| `ttc_ms` | Tiempo total de la llamada |
+| `otps` | output_tokens / (ttc - ttft) |
+| `input_tokens` | `response.usage.input_tokens` |
+| `output_tokens` | `response.usage.output_tokens` |
+| `total_tokens` | input + output |
+| `cost_usd` | input_tokens · price_in + output_tokens · price_out (pricing por modelo) |
+
+Pricing por modelo (USD por millón de tokens, input/output):
+- `claude-haiku-4-5-20251001`: 0.80 / 4.00
+- `claude-sonnet-4-6`: 3.00 / 15.00
+- `claude-opus-4-7`: 15.00 / 75.00
+
+### 5.3 Los 3 evaluadores (operan sobre el output del agente)
+
+| Tipo | Qué evalúa | Implementación |
+|------|-----------|----------------|
+| **Exact Match** | ¿El output del agente menciona explícitamente los `rule_id` esperados? | `expected_rule_id in agent_output_str` |
+| **Rule-Based** | ¿El JSON es schema-válido? ¿`decision` ∈ {GO, NO-GO}? ¿`violations` es una lista? | Validación Python + chequeos estructurales |
+| **LLM-as-Judge** | ¿El campo `reasoning` justifica correctamente la decisión? | Llamada Claude con prompt evaluador |
+
+---
+
+## 6. Schema del JSON de resultados
+
+```json
+{
+  "run_id": "2026-05-20T10:30:00Z",
+  "lab": "lab01",
+  "model": "claude-sonnet-4-6",
+  "test_cases": [
+    {
+      "case_id": "with_violations",
+      "agent_output": {
+        "decision": "NO-GO",
+        "violations": [{"rule_id": "...", "file": "...", "line": 3, "evidence": "..."}],
+        "reasoning": "..."
+      },
+      "quality": {
+        "decision_match": true,
+        "true_positives": 11,
+        "false_positives": 1,
+        "false_negatives": 2,
+        "precision": 0.917,
+        "recall": 0.846,
+        "f1": 0.880
+      },
+      "performance": {
+        "ttft_ms": 320,
+        "ttc_ms": 2100,
+        "otps": 48.5,
+        "input_tokens": 1512,
+        "output_tokens": 487,
+        "total_tokens": 1999,
+        "cost_usd": 0.012
+      },
+      "evaluators": [
+        {"type": "exact_match", "rule_id": "use_internal_http", "passed": true, "score": 1.0},
+        {"type": "rule_based",  "check": "valid_json_schema",   "passed": true, "score": 1.0},
+        {"type": "llm_judge",   "check": "reasoning_quality",   "passed": true, "score": 8.5}
+      ]
+    },
+    { "case_id": "clean", "...": "..." }
+  ],
+  "aggregate": {
+    "overall_pass": true,
+    "avg_precision": 0.91,
+    "avg_recall": 0.92,
+    "avg_f1": 0.91,
+    "total_input_tokens": 3050,
+    "total_output_tokens": 720,
+    "total_cost_usd": 0.022,
+    "total_ttft_ms": 640
+  }
+}
+```
+
+---
+
+## 7. Estructura del notebook (`01_sdlc_gatekeeper.ipynb`)
+
+```
+Celda 01 — Markdown  : Título: Lab 01 — Eval sobre un Agente Gatekeeper
+Celda 02 — Markdown  : ¿Qué evaluamos aquí? (el SUT es el agente, no los archivos)
+Celda 03 — Code      : Setup (imports, dotenv, API key, _find_repo_root, paths)
+Celda 04 — Markdown  : Referencias pedagógicas — qué es buen/mal código
+Celda 05 — Code      : Mostrar examples/good_code/api_client.py
+Celda 06 — Code      : Mostrar examples/bad_code/api_client_bad.py
+Celda 07 — Markdown  : Construir el prompt del agente gatekeeper
+Celda 08 — Code      : Cargar rules.yaml + agent_prompt.md + inyectar
+Celda 09 — Markdown  : Los test repos y el golden dataset
+Celda 10 — Code      : Cargar golden_dataset.yaml, leer test_repos/with_violations/
+Celda 11 — Markdown  : Ejecutar el agente (streaming, captura métricas perf)
+Celda 12 — Code      : Función run_agent() con streaming + medición TTFT/TTC/tokens/cost
+Celda 13 — Code      : Ejecutar agente sobre with_violations; mostrar output
+Celda 14 — Markdown  : Métricas de quality — precision, recall, F1
+Celda 15 — Code      : Calcular TP/FP/FN, precision, recall, F1 vs golden
+Celda 16 — Markdown  : Los 3 evaluadores sobre el output del agente
+Celda 17 — Code      : ExactMatchEvaluator, RuleBasedEvaluator, LLMJudgeEvaluator
+Celda 18 — Code      : Ejecutar los 3 evaluadores sobre el output
+Celda 19 — Markdown  : Pipeline completo — ambos test cases
+Celda 20 — Code      : Loop sobre ambos casos, agregar resultados
+Celda 21 — Code      : Exportar JSON a results/
+Celda 22 — Markdown  : Reflexión — ¿qué modelo es el mejor gatekeeper?
+```
+
+---
+
+## 8. CLI script (`01_sdlc_gatekeeper.py`)
+
+Argumentos:
+- `--case CASE_ID` — opcional; si no, ejecuta todos los casos del golden dataset
+- `--model MODEL_ID` — default `claude-sonnet-4-6`
+- `--rules PATH` — default `config/rules.yaml`
+- `--prompt PATH` — default `labs/01_sdlc_gatekeeper/agent_prompt.md`
+- `--golden PATH` — default `examples/test_repos/golden_dataset.yaml`
+- `--output PATH` — opcional, ruta del JSON de salida
+
+Flujo:
+1. Carga rules.yaml, agent_prompt.md (template), golden_dataset.yaml
+2. Para cada test case:
+   a. Lee todos los `.py` de `repo_path`
+   b. Inyecta `{rules}` y `{codebase}` en el template
+   c. Llama a Claude con streaming, captura métricas perf
+   d. Parsea JSON del output (con fallback robusto si falla)
+   e. Calcula quality metrics vs `expected_violations`
+   f. Ejecuta los 3 evaluadores sobre el output
+3. Agrega JSON final
+4. `sys.exit(1)` si `aggregate.overall_pass == false` (regla: overall_pass = avg_f1 ≥ 0.7 AND decisiones de todos los casos correctas)
+
+---
+
+## 9. Criterios de aceptación
 
 | ID | Criterio | Verificación |
 |----|----------|-------------|
-| AC-01 | El pipeline detecta el 100% de las violaciones en `bad_code/` | Ejecutar sobre los 3 archivos bad_code y confirmar `decision: NO-GO` en los 3 |
-| AC-02 | El pipeline emite `decision: GO` para todos los archivos `good_code/` | Ejecutar sobre los 3 archivos good_code y confirmar `decision: GO` en los 3 |
-| AC-03 | El JSON de salida cumple el schema definido (todos los campos presentes) | Validar con `jsonschema` o revisión manual |
-| AC-04 | El evaluador exact_match detecta `import requests` en `api_client_bad.py` | Campo `passed: false` en regla `use_internal_http` |
-| AC-05 | El evaluador rule_based detecta magic numbers en `data_processor_bad.py` | Campo `passed: false` en regla `no_magic_numbers` |
-| AC-06 | El evaluador llm_judge detecta el hardcoded API key en `service_bad.py` | Campo `passed: false` en regla `no_hardcoded_secrets` |
-| AC-07 | El notebook es autocontenido: se ejecuta desde zero sin notebooks previos | Kernel restart + Run All sin errores |
-| AC-08 | `01_sdlc_gatekeeper.py` acepta `--file` y `--model` como args de CLI | `python 01_sdlc_gatekeeper.py --file ../../examples/bad_code/api_client_bad.py --model claude-sonnet-4-6` |
-| AC-09 | Compatible con Codespaces (sin dependencias de filesystem local) | Probar en github.dev o Codespace limpio |
-| AC-10 | `results/` contiene el JSON exportado tras la ejecución completa | Verificar que el archivo se crea con timestamp en el nombre |
+| AC-01 | `agent_prompt.md` contiene placeholders `{rules}` y `{codebase}` | `grep` |
+| AC-02 | `golden_dataset.yaml` carga sin errores y contiene 2 `test_cases` | `python3 -c "import yaml; ..."` |
+| AC-03 | `test_repos/with_violations/` tiene ≥3 archivos `.py` válidos | `find + ast.parse` |
+| AC-04 | `test_repos/clean/` tiene ≥3 archivos `.py` válidos | `find + ast.parse` |
+| AC-05 | El script ejecuta el agente con streaming y captura TTFT > 0 | Ejecutar con API key real |
+| AC-06 | El JSON final tiene `quality.precision`, `quality.recall`, `quality.f1`, `performance.ttft_ms` | Inspección de output |
+| AC-07 | Sobre `with_violations`, recall ≥ 0.6 con sonnet-4-6 | Ejecutar con API key real |
+| AC-08 | Sobre `clean`, precision = 1.0 (sin falsos positivos) | Ejecutar con API key real |
+| AC-09 | El notebook ejecuta de cero a fin sin errores en Kernel Restart + Run All | Verificación en Codespaces |
+| AC-10 | El CLI sale con código 1 cuando `overall_pass == false` | `python ...; echo $?` |
 
 ---
 
-## 8. Notas de implementación
+## 10. Notas de implementación
 
-### Uso del API de Anthropic
-
-- **Modelo por defecto**: `claude-sonnet-4-6` (balance coste/calidad para evaluación).
-- **max_tokens**: 256 es suficiente para el JSON de respuesta del juez. No usar valores más altos para controlar coste.
-- **Temperature**: usar el valor por defecto (1.0) — la aleatoriedad no perjudica la evaluación y mantiene el comportamiento estándar del SDK.
-- **Carga del cliente**: instanciar `anthropic.Anthropic()` una sola vez por ejecución de pipeline, no por llamada.
-- **Prompt caching**: no se aplica en este lab (los prompts varían por archivo); documentar esto como área de mejora en Lab 03.
-
-### Manejo de errores
+### Streaming para medir TTFT
 
 ```python
-# Errores de parsing del JSON del juez
-try:
-    parsed = json.loads(raw)
-except json.JSONDecodeError:
-    # Fallback: marcar como fallo con evidencia del raw response
-    return EvalResult(
-        rule_id=rule["id"],
-        type="llm_judge",
-        passed=False,
-        evidence=f"LLM returned non-JSON response: {raw[:100]}",
-        score=0.0,
-    )
-
-# Rate limit / API errors
-import anthropic
-try:
-    message = client.messages.create(...)
-except anthropic.RateLimitError:
-    time.sleep(30)  # Backoff simple; en producción usar tenacity
-    message = client.messages.create(...)
-except anthropic.APIError as e:
-    raise RuntimeError(f"Anthropic API error on rule {rule['id']}: {e}") from e
+ttft = None
+start = time.perf_counter()
+with client.messages.stream(model=model, max_tokens=2000, messages=[{"role":"user","content":prompt}]) as stream:
+    for event in stream:
+        if ttft is None and event.type == "content_block_start":
+            ttft = time.perf_counter() - start
+    final_msg = stream.get_final_message()
+ttc = time.perf_counter() - start
+input_tokens = final_msg.usage.input_tokens
+output_tokens = final_msg.usage.output_tokens
+text = "".join(b.text for b in final_msg.content if hasattr(b, "text"))
 ```
 
-### AST — consideraciones importantes
-
-- `ast.parse()` lanza `SyntaxError` si el archivo tiene syntax errors de Python — capturar y marcar todas las reglas rule_based como `passed=False` con evidence `"Syntax error: cannot parse file"`.
-- Python 3.12 usa `ast.Constant` para literales (no `ast.Num` ni `ast.Str` que son deprecated). El código debe usar `ast.Constant` exclusivamente.
-- Para la regla `no_magic_numbers`, excluir `0`, `1`, `-1` ya que son valores idiomáticos en Python (índices, flags booleanos, etc.).
-
-### Estructura del CLI (`01_sdlc_gatekeeper.py`)
+### Parseo robusto del JSON del agente
 
 ```python
-import argparse
-
-parser = argparse.ArgumentParser(description="SDLC Gatekeeper")
-parser.add_argument("--file", required=True, help="Path to Python file to evaluate")
-parser.add_argument("--model", default="claude-sonnet-4-6", help="Claude model ID")
-parser.add_argument("--rules", default="config/rules.yaml", help="Path to rules.yaml")
-parser.add_argument("--output", default=None, help="Optional path to save JSON result")
-args = parser.parse_args()
+def extract_json(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end+1])
+        raise
 ```
 
-El script debe terminar con `sys.exit(1)` si la decisión es `NO-GO` — esto hace que el step de GitHub Actions falle y bloquee el merge.
+### Cálculo de quality metrics
 
-### Formato del archivo de resultados
-
-El JSON se guarda en `results/` con el nombre:
-
+```python
+def compute_quality(agent_output, expected):
+    detected = {(v["rule_id"], v["file"]) for v in agent_output.get("violations", [])}
+    expected_set = {(v["rule_id"], v["file"]) for v in expected["expected_violations"]}
+    tp = len(detected & expected_set)
+    fp = len(detected - expected_set)
+    fn = len(expected_set - detected)
+    precision = tp / (tp + fp) if (tp + fp) else 1.0
+    recall    = tp / (tp + fn) if (tp + fn) else 1.0
+    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {
+        "decision_match": agent_output.get("decision") == expected["expected_decision"],
+        "true_positives": tp, "false_positives": fp, "false_negatives": fn,
+        "precision": round(precision, 3), "recall": round(recall, 3), "f1": round(f1, 3),
+    }
 ```
-results/YYYY-MM-DD_HH-MM_lab01_<model_id>.json
+
+### Pricing helper
+
+```python
+PRICING = {
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-7": (15.00, 75.00),
+}
+def cost_usd(model, tin, tout):
+    pin, pout = PRICING.get(model, (3.00, 15.00))
+    return round((tin * pin + tout * pout) / 1_000_000, 6)
 ```
 
-Ejemplo: `results/2026-05-20_10-30_lab01_claude-sonnet-4-6.json`
+### Dependencias
 
-El campo `model` en el JSON usa el model_id completo (ej. `claude-sonnet-4-6`), no un alias.
-
-### Dependencias en `requirements.txt`
-
+`requirements.txt`:
 ```
 anthropic>=0.40.0
 pyyaml>=6.0
+python-dotenv>=1.0
 ```
 
-No añadir más dependencias. El módulo `ast` es parte de la stdlib de Python. `json`, `re`, `pathlib`, `datetime`, `argparse` también son stdlib.
-
----
-
-## Apéndice — Diagrama de flujo del pipeline
-
-```
-examples/bad_code/*.py
-        |
-        v
-  [Cargar rules.yaml]
-        |
-        v
-  Para cada rule:
-  +-----------------------------------+
-  | type == "exact_match"             | --> ExactMatchEvaluator.evaluate()
-  | type == "rule_based"              | --> RuleBasedEvaluator.evaluate()
-  | type == "llm_judge"               | --> evaluate_with_llm()  [Anthropic API]
-  +-----------------------------------+
-        |
-        v
-  [Agregar EvalResult[]]
-        |
-        v
-  any(not r.passed)?
-     YES --> decision = "NO-GO"  -->  sys.exit(1)  [bloquea CI]
-      NO --> decision = "GO"     -->  sys.exit(0)  [CI continua]
-        |
-        v
-  Guardar JSON en results/
-```
+No añadir más — `json`, `time`, `pathlib`, `argparse`, `dataclasses` son stdlib.

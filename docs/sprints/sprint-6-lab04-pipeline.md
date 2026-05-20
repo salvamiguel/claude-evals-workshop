@@ -108,21 +108,25 @@ Cada gate tiene criterios de aceptación programáticos. El pipeline evalúa est
 
 ### 5.1 Gate 1 — Code Quality
 
-| Criterio         | Umbral | Justificacion                                              |
-|------------------|--------|------------------------------------------------------------|
-| `decision`       | `GO`   | Ninguna regla critica violada segun el evaluador LLM       |
-| `failed_rules`   | `0`    | El SDLC Gatekeeper no debe reportar violaciones de reglas  |
+| Criterio         | Umbral | Justificacion                                                        |
+|------------------|--------|----------------------------------------------------------------------|
+| `overall_pass`   | `true` | Todos los test cases del golden dataset deben ser aprobados          |
+| `avg_f1`         | ≥ 0.7  | Calidad minima del agente gatekeeper medida con F1 sobre violaciones |
 
 ```python
 def evaluate_gate_1(result: dict) -> tuple[bool, dict]:
+    aggregate = result.get("aggregate", {})
     passed = (
-        result.get("decision") == "GO"
-        and result.get("failed_rules", 1) == 0
+        aggregate.get("overall_pass") is True
+        and aggregate.get("avg_f1", 0.0) >= 0.7
     )
     return passed, {
-        "status": "GO" if passed else "NO-GO",
-        "failed_rules": result.get("failed_rules", "N/A"),
-        "decision": result.get("decision"),
+        "lab01_run_id": result.get("run_id"),
+        "model": result.get("model"),
+        "overall_pass": aggregate.get("overall_pass"),
+        "avg_f1": aggregate.get("avg_f1"),
+        "decision_matches": f"{sum(tc['quality']['decision_match'] for tc in result.get('test_cases', []))}/{len(result.get('test_cases', []))}",
+        "total_cost_usd": aggregate.get("total_cost_usd"),
     }
 ```
 
@@ -192,12 +196,15 @@ Celda de texto con el diagrama del pipeline, la motivacion de los three-gate pat
 
 ### Seccion 2 — Gate 1: SDLC Gatekeeper
 
-Reimplementacion compacta del evaluador del Lab 01:
+Invocacion del agente gatekeeper de Lab 01 sobre el `code_snippet` de la PR simulada. El agente recibe el snippet como un "test repo" virtual (un solo archivo) y devuelve el JSON con `decision/violations/reasoning`.
 
-1. Construccion del prompt que pide al modelo analizar `PR_SIMULATION["code_snippet"]` contra las reglas del `config/rules.yaml`.
-2. Llamada al modelo con `client.messages.create`.
-3. Parsing de la respuesta para extraer `decision` y `failed_rules`.
-4. Llamada a `evaluate_gate_1` para decidir si el pipeline continua.
+1. Carga `config/rules.yaml` y `labs/01_sdlc_gatekeeper/agent_prompt.md`.
+2. Inyecta las reglas y el snippet de la PR en el template del prompt.
+3. Llamada al modelo con streaming para capturar metricas de performance.
+4. Parsing del output JSON del agente (con fallback `extract_json` si viene con fences).
+5. Llamada a `evaluate_gate_1(agent_output, golden_for_snippet)` que calcula `decision_match` y aplica el SLA (overall_pass = avg_f1 >= 0.7 AND decision_match).
+
+El resultado del gate usa el schema de Lab 01: `aggregate.overall_pass`, `aggregate.avg_f1`, `total_cost_usd` y `total_ttft_ms`. Para PRs simuladas con golden conocido, el gate compara violaciones detectadas vs esperadas; para PRs sin golden (PRs reales en el futuro), el gate se limita a `decision_match`.
 
 Si el gate falla, el notebook muestra un bloque de error explicativo y el pipeline no ejecuta las siguientes secciones (se controla con una variable `pipeline_state`).
 
@@ -275,8 +282,12 @@ Celda de texto que cierra el lab con preguntas de reflexion para el alumno:
   "gates": {
     "code_quality": {
       "status": "GO",
-      "failed_rules": 0,
-      "decision": "GO"
+      "lab01_run_id": "2026-05-20T12:00:00.000000+00:00",
+      "model": "claude-sonnet-4-6",
+      "overall_pass": true,
+      "avg_f1": 0.88,
+      "decision_matches": "2/2",
+      "total_cost_usd": 0.022
     },
     "agent_quality": {
       "status": "PASS",
@@ -303,8 +314,12 @@ Cuando el pipeline termina con `MERGE_BLOCKED`, el campo `final_decision` incluy
   "gates": {
     "code_quality": {
       "status": "NO-GO",
-      "failed_rules": 2,
-      "decision": "NO-GO"
+      "lab01_run_id": "2026-05-20T12:00:00.000000+00:00",
+      "model": "claude-sonnet-4-6",
+      "overall_pass": false,
+      "avg_f1": 0.54,
+      "decision_matches": "1/2",
+      "total_cost_usd": 0.018
     },
     "agent_quality": null,
     "performance": null
@@ -493,12 +508,13 @@ Los errores de API (timeout, rate limit, error de parsing de la respuesta) no de
 ```python
 def run_gate_1(client, pr_simulation):
     try:
-        # logica del gate...
-        return {"decision": decision, "failed_rules": failed_rules}
+        # logica del gate: invoca run_lab01.py y lee su JSON de resultados
+        # El JSON sigue el schema de Lab 01 con aggregate.overall_pass y aggregate.avg_f1
+        return lab01_result  # dict con run_id, model, test_cases[], aggregate{}
     except anthropic.RateLimitError as e:
-        return {"decision": "ERROR", "failed_rules": -1, "error": str(e)}
+        return {"run_id": None, "model": None, "aggregate": {"overall_pass": False, "avg_f1": 0.0}, "error": str(e)}
     except Exception as e:
-        return {"decision": "ERROR", "failed_rules": -1, "error": str(e)}
+        return {"run_id": None, "model": None, "aggregate": {"overall_pass": False, "avg_f1": 0.0}, "error": str(e)}
 ```
 
 Un gate con `decision: ERROR` se trata como fallo (early-exit) y su status en el reporte se registra como `"ERROR"` en lugar de `"NO-GO"` para facilitar el diagnostico.

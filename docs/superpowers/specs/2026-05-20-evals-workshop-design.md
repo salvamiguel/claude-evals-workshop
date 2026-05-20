@@ -40,16 +40,20 @@ claude-evals-workshop/
 │       ├── 04_advanced.py
 │       └── requirements.txt
 ├── examples/
-│   ├── good_code/
-│   │   ├── api_client.py           # Código correcto (pasa todas las reglas)
+│   ├── good_code/                  # Referencia pedagógica mostrada en notebook (no evaluada)
+│   │   ├── api_client.py
 │   │   ├── data_processor.py
 │   │   └── service.py
-│   └── bad_code/
-│       ├── api_client_bad.py       # Violaciones: requests en vez de httpx_internal
-│       ├── data_processor_bad.py   # Magic numbers, imports no aprobados
-│       └── service_bad.py          # Anti-patrones: God class, hardcoded secrets
+│   ├── bad_code/                   # Referencia pedagógica mostrada en notebook (no evaluada)
+│   │   ├── api_client_bad.py
+│   │   ├── data_processor_bad.py
+│   │   └── service_bad.py
+│   └── test_repos/                 # Inputs reales del agente — codebases a evaluar
+│       ├── with_violations/        # 3 archivos .py con violaciones conocidas
+│       ├── clean/                  # 3 archivos .py sin violaciones
+│       └── golden_dataset.yaml     # Violaciones esperadas + decisión por test repo
 ├── config/
-│   └── rules.yaml                  # Reglas SDLC versionadas
+│   └── rules.yaml                  # Reglas SDLC versionadas (se inyectan en el prompt del agente)
 ├── .github/
 │   ├── workflows/
 │   │   ├── run_evals.yml           # Dispara labs manualmente (model_id + lab_id)
@@ -108,24 +112,46 @@ claude-evals-workshop/
 
 ### Lab 01 — SDLC Gatekeeper
 
-**Objetivo:** Construir un evaluador que actúe como guardián de calidad en el pipeline CI/CD.
+**Objetivo:** Evaluar un **agente Claude** que actúa como guardián de calidad de código (SDLC gatekeeper) en un pipeline CI/CD. El lab mide si el agente detecta correctamente las violaciones de reglas SDLC en un codebase.
+
+**Concepto clave — qué es el "Sistema Bajo Prueba":**
+
+| Capa | Qué es |
+|------|--------|
+| **SUT** | El agente Claude con un **prompt** que contiene las reglas SDLC. El prompt es el artefacto que iteramos y testeamos. |
+| **Inputs del SUT** | El contenido de un test repo: `examples/test_repos/{case}/*.py` |
+| **Output del SUT** | JSON: `{decision: GO/NO-GO, violations: [...], reasoning}` |
+| **El Eval** | Compara el output del agente vs un **golden dataset** con violaciones esperadas; mide quality + performance |
 
 **Flujo:**
 ```
-/examples/bad_code/*.py
-        ↓
-Carga config/rules.yaml
-        ↓
-┌─────────────────────────────────────┐
-│ Evaluador 1: Exact Match            │ → regex/grep Python
-│ Evaluador 2: Rule-Based             │ → lógica Python (AST/regex)
-│ Evaluador 3: LLM-as-Judge (Claude)  │ → prompt estructurado
-└─────────────────────────────────────┘
-        ↓
-JSON: { rule_id, pass/fail, evidence, score }
-        ↓
-Decisión: GO / NO-GO (si cualquier regla falla → NO-GO)
+config/rules.yaml  +  labs/01_sdlc_gatekeeper/agent_prompt.md
+                            ↓ (template: rules inyectadas en el prompt)
+                  Prompt del Gatekeeper Agent
+                            ↓
+   Para cada test repo (with_violations, clean):
+       └─→ Lee examples/test_repos/{case}/*.py
+       └─→ Llama a Claude (streaming, captura TTFT/TTC/tokens/cost)
+       └─→ Parsea output JSON del agente
+                            ↓
+   examples/test_repos/golden_dataset.yaml  (violaciones esperadas)
+                            ↓
+   ┌──────────────────────────────────────────────────┐
+   │ Eval 1: Exact Match    │ ¿menciona rule_ids esperados? │
+   │ Eval 2: Rule-Based     │ ¿JSON válido? ¿decision match? │
+   │ Eval 3: LLM-as-Judge   │ ¿reasoning correcto?           │
+   └──────────────────────────────────────────────────┘
+                            ↓
+   Métricas:
+     Quality: precision, recall, F1, decision_match
+     Performance: TTFT, TTC, OTPS, input/output/total tokens, cost_usd
+                            ↓
+   JSON agregado → results/
 ```
+
+**Por qué este diseño:** Permite comparar haiku/sonnet/opus — ¿qué modelo hace mejor gatekeeping? Compara precision/recall (¿se le escapan violaciones?) con coste y latencia (¿vale la pena un modelo más caro?). Esto es un eval real sobre un agente IA en producción.
+
+**Rol de `examples/good_code/` y `examples/bad_code/`:** referencia pedagógica mostrada en el notebook (mostrar qué consideramos buen/mal código). NO se usan en el pipeline.
 
 **Reglas en `config/rules.yaml`:**
 ```yaml
@@ -225,25 +251,36 @@ rules:
     score_threshold: 6.0
 ```
 
+**Test repos en `examples/test_repos/`** — codebases que el agente debe analizar. El `golden_dataset.yaml` lista las violaciones esperadas por repo, contra las que se mide el output del agente.
+
 **Output JSON por ejecución:**
 ```json
 {
   "run_id": "2026-05-20T10:30:00Z",
-  "file": "examples/bad_code/api_client_bad.py",
+  "lab": "lab01",
   "model": "claude-sonnet-4-6",
-  "results": [
+  "test_cases": [
     {
-      "rule_id": "use_internal_http",
-      "type": "exact_match",
-      "passed": false,
-      "evidence": "Line 3: import requests",
-      "score": 0.0
+      "case_id": "with_violations",
+      "agent_output": { "decision": "NO-GO", "violations": [...], "reasoning": "..." },
+      "quality": {
+        "decision_match": true,
+        "precision": 0.917, "recall": 0.846, "f1": 0.880,
+        "true_positives": 11, "false_positives": 1, "false_negatives": 2
+      },
+      "performance": {
+        "ttft_ms": 320, "ttc_ms": 2100, "otps": 48.5,
+        "input_tokens": 1512, "output_tokens": 487, "total_tokens": 1999,
+        "cost_usd": 0.012
+      },
+      "evaluators": [...]
     }
   ],
-  "decision": "NO-GO",
-  "passed_rules": 2,
-  "failed_rules": 3,
-  "aggregate_score": 4.2
+  "aggregate": {
+    "overall_pass": true,
+    "avg_precision": 0.91, "avg_recall": 0.92, "avg_f1": 0.91,
+    "total_cost_usd": 0.022, "total_ttft_ms": 640
+  }
 }
 ```
 
