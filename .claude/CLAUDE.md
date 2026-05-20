@@ -1,6 +1,6 @@
 # Claude Evals Workshop
 
-Workshop para demostrar el valor de los evals en el SDLC con IA. Audiencia: arquitectos y devs del Anthropic Partner Basecamp (NTT Data).
+Workshop para demostrar el valor de los evals en el SDLC con IA. Audiencia: arquitectos y devs del Anthropic Partner Basecamp.
 
 ## Idioma
 - **Código**: siempre en inglés
